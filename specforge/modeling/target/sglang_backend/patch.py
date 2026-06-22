@@ -1,4 +1,5 @@
 import logging
+import inspect
 from typing import Optional
 
 import sglang.srt.distributed.parallel_state as parallel_state
@@ -18,6 +19,16 @@ from sglang.srt.utils import get_bool_env_var
 from specforge.distributed import get_tp_group as get_specforge_tp_group
 
 logger = logging.getLogger(__name__)
+
+
+def _init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+    parameters = inspect.signature(init_model_parallel_group).parameters
+    if not any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return init_model_parallel_group(group_ranks, local_rank, backend, **kwargs)
 
 
 def init_distributed_environment(
@@ -132,7 +143,7 @@ def initialize_model_parallel(
 
     # message queue broadcaster is only used in tensor model parallel group
     # NOTE: torch_compile parameter was removed in sglang 0.5.9
-    parallel_state._TP = init_model_parallel_group(
+    parallel_state._TP = _init_model_parallel_group(
         group_ranks,
         parallel_state._WORLD.local_rank,
         backend,
@@ -148,7 +159,7 @@ def initialize_model_parallel(
             parallel_state._PDMUX_PREFILL_TP_GROUP is None
         ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
         # NOTE: torch_compile parameter was removed in sglang 0.5.9
-        parallel_state._PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
+        parallel_state._PDMUX_PREFILL_TP_GROUP = _init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
@@ -178,7 +189,7 @@ def initialize_model_parallel(
             ranks = list(range(st, en, moe_tp_size))
             group_ranks.append(ranks)
 
-    parallel_state._MOE_EP = init_model_parallel_group(
+    parallel_state._MOE_EP = _init_model_parallel_group(
         group_ranks,
         parallel_state._WORLD.local_rank,
         backend,
@@ -199,7 +210,7 @@ def initialize_model_parallel(
                 en = i * tensor_model_parallel_size + (j + 1) * moe_tp_size
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
-        parallel_state._MOE_TP = init_model_parallel_group(
+        parallel_state._MOE_TP = _init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
@@ -221,7 +232,7 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
-    parallel_state._PP = init_model_parallel_group(
+    parallel_state._PP = _init_model_parallel_group(
         group_ranks,
         parallel_state._WORLD.local_rank,
         backend,
@@ -262,7 +273,7 @@ def initialize_model_parallel(
                     )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
-        parallel_state._ATTN_CP = init_model_parallel_group(
+        parallel_state._ATTN_CP = _init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
@@ -291,7 +302,7 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
-        parallel_state._ATTN_TP = init_model_parallel_group(
+        parallel_state._ATTN_TP = _init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
@@ -322,7 +333,7 @@ def initialize_model_parallel(
                 ) * tensor_model_parallel_size + tp_ep_combined_idx
                 ranks = list(range(st, en, moe_tp_size_for_dp * moe_ep_size))
                 group_ranks.append(ranks)
-        parallel_state._MOE_DP = init_model_parallel_group(
+        parallel_state._MOE_DP = _init_model_parallel_group(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
