@@ -240,6 +240,21 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
+    # Choose the data-parallel group for sharding samples across ranks.
+    # With the SGLang backend in DP-attention mode the target runs data-parallel
+    # across ALL ranks (each rank computes its own sequences' attention; experts
+    # are expert-parallel), so the draft must also see a distinct shard per rank
+    # -> shard over the whole world (process_group=None). Otherwise the target is
+    # TP-replicated and ranks within a TP group must consume identical data, so we
+    # shard over the DP group only.
+    use_dp_attention = (
+        args.target_model_backend == "sglang" and args.sglang_enable_dp_attention
+    )
+    data_parallel_group = None if use_dp_attention else get_dp_group()
+    print_on_rank0(
+        f"Data-parallel sharding over {'WORLD (dp-attention)' if use_dp_attention else 'DP group'}"
+    )
+
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
@@ -274,7 +289,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=data_parallel_group,
     )
 
     eval_dataloader = None
@@ -299,7 +314,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=data_parallel_group,
         )
 
     return train_dataloader, eval_dataloader

@@ -366,14 +366,20 @@ def initialize_dp_attention(
 
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
-    # NOTE: Added attn_cp_size parameter for sglang 0.5.9
+    # NOTE: Added attn_cp_size parameter for sglang 0.5.9.
+    # compute_dp_attention_world_info returns 3 values in sglang<=0.5.9 but 4
+    # (it appended attn_dp_size) in >=0.5.10, including the 0.5.13 the image
+    # ships. Unpack defensively so this works across versions.
+    _world_info = compute_dp_attention_world_info(
+        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
+    )
     (
         dp_attention._ATTN_TP_RANK,
         dp_attention._ATTN_TP_SIZE,
         dp_attention._ATTN_DP_RANK,
-    ) = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )
+    ) = _world_info[:3]
+    if len(_world_info) > 3:
+        dp_attention._ATTN_DP_SIZE = _world_info[3]
     _, _, dp_attention._LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
     )
