@@ -5,6 +5,11 @@ Most documentation files are located under the `docs/` folder.
 
 ## Docs Workflow
 
+## Example Runbooks
+
+- [`examples/qwen3-4b-dflash-swebench-codex-rollout.md`](examples/qwen3-4b-dflash-swebench-codex-rollout.md): Phase A runbook for generating Qwen3-4B DFlash agentic SWE-bench rollout JSONL with Codex and Daytona sandboxes.
+- [`examples/qwen3-4b-dflash-swebench-codex-reproduction.md`](examples/qwen3-4b-dflash-swebench-codex-reproduction.md): completed reproduction audit for the rollout, including tokenizer/chat-template/loss-mask validation.
+
 ### Install Dependency
 
 ```bash

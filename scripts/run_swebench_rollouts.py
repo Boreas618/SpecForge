@@ -36,10 +36,10 @@ Run this in harbor's environment (e.g. ``uv run``), since it imports harbor.
 
 Codex wire-API caveat
 ---------------------
-The Codex CLI defaults to OpenAI's *Responses* API. If your SGLang server only
-implements ``/v1/chat/completions``, configure Codex to use the chat wire API
-(a custom ``model_provider`` with ``wire_api = "chat"`` in Codex's
-``config.toml``); otherwise the rollouts will fail to reach the model.
+Current Codex CLI releases use OpenAI's *Responses* API and reject the legacy
+``wire_api = "chat"`` provider setting. Keep ``CODEX_WIRE_API=responses`` for
+SGLang versions that expose ``/v1/responses``. The env-gated chat provider path
+is retained only for older Codex builds that still support it.
 
 Example
 -------
@@ -341,12 +341,29 @@ def mask_assistant_tokens(
     """
 
     def render(msgs: List[Dict], add_generation_prompt: bool) -> List[int]:
-        return list(
-            tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+        if not hasattr(tokenizer, "encode"):
+            rendered = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
                 msgs,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
+            )
+            if hasattr(rendered, "ids"):
+                rendered = rendered.ids
+            elif hasattr(rendered, "input_ids"):
+                rendered = rendered.input_ids
+            return list(rendered)
+
+        rendered = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
+            msgs,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+        return list(
+            tokenizer.encode(  # type: ignore[attr-defined]
+                rendered,
+                add_special_tokens=False,
             )
         )
 
@@ -427,6 +444,7 @@ async def run_rollouts(task_paths: List[Path], args: argparse.Namespace):
             env={
                 "OPENAI_BASE_URL": args.api_base,
                 "OPENAI_API_KEY": args.openai_api_key or "sk-local-sglang",
+                "CODEX_WIRE_API": os.environ.get("CODEX_WIRE_API", "responses"),
             },
         )
     else:
@@ -456,15 +474,16 @@ async def run_rollouts(task_paths: List[Path], args: argparse.Namespace):
         n_concurrent_trials=args.n_concurrent,
         n_attempts=args.n_attempts,
         environment=EnvironmentConfig(
-            type=EnvironmentType.DOCKER,
+            type=EnvironmentType(args.environment),
             force_build=args.force_build,
             delete=not args.keep_containers,
+            kwargs=json.loads(args.env_kwargs) if args.env_kwargs else {},
         ),
         agents=[agent_config],
         tasks=[TaskConfig(path=p) for p in task_paths],
     )
 
-    job = Job(config=config)
+    job = await Job.create(config)
     return await job.run()
 
 
@@ -942,6 +961,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--jobs-dir", type=Path, default=default_jobs)
     p.add_argument("--job-name", type=str,
                    default=datetime.now(timezone.utc).strftime("swebench-%Y%m%d-%H%M%S"))
+    p.add_argument("--environment", type=str, default="docker",
+                   help="Harbor EnvironmentType (docker, daytona, modal, ...).")
+    p.add_argument("--env-kwargs", type=str, default=None,
+                   help="JSON dict merged into EnvironmentConfig.kwargs "
+                        "(provider-specific).")
     p.add_argument("--force-build", action="store_true",
                    help="Force rebuild of task Docker images.")
     p.add_argument("--keep-containers", action="store_true",
@@ -1019,9 +1043,8 @@ def main() -> int:
         if args.agent == "codex":
             print(
                 "No training rows produced. Check that Codex actually reached "
-                "the target (the Codex CLI defaults to the OpenAI Responses "
-                "API; if your SGLang server only serves /v1/chat/completions, "
-                "configure a Codex model_provider with wire_api=\"chat\"), and "
+                "the target (the current Codex CLI uses the OpenAI Responses "
+                "API; set CODEX_WIRE_API=responses for SGLang /v1/responses), and "
                 "that trajectory.json files exist under each trial's agent/ dir."
             )
         else:
