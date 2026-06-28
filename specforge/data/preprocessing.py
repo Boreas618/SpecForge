@@ -465,6 +465,122 @@ def build_eagle3_dataset(
 
 
 # ==============================
+# DFlash Pretokenized Dataset (agentic rollouts)
+# ==============================
+def build_dflash_pretokenized_dataset(
+    dataset: HFDataset,
+    max_length: Optional[int] = 4096,
+    num_proc: Optional[int] = 8,
+    cache_dir: Optional[str] = None,
+    cache_key: Optional[str] = None,
+    shuffle_seed: Optional[int] = 42,
+    min_reward: Optional[float] = None,
+    input_ids_key: str = "input_ids",
+    loss_mask_key: str = "loss_mask",
+    reward_key: str = "reward",
+) -> HFDataset:
+    """Build a DFlash training dataset from already-tokenized rollouts.
+
+    Unlike :func:`build_eagle3_dataset`, this path performs NO chat-template
+    rendering or tokenization. It expects rows that already carry parallel
+    ``input_ids`` and ``loss_mask`` integer sequences (e.g. produced by the
+    agentic SWE-bench rollout driver, where ``loss_mask`` is 1 exactly on the
+    target model's generated tokens). The output is shaped identically to
+    :func:`build_eagle3_dataset` / :func:`preprocess_conversations` so the same
+    ``DataCollatorWithPadding`` and ``prepare_dp_dataloaders`` work unchanged:
+    each row exposes ``input_ids``/``attention_mask``/``loss_mask`` as torch
+    tensors of shape ``(1, n)``.
+
+    Args:
+        dataset: HF dataset whose rows contain ``input_ids_key`` and
+            ``loss_mask_key`` (lists of ints), optionally ``reward_key``.
+        max_length: Defensive truncation length (head). The rollout driver is
+            expected to window long trajectories; this only guards. None keeps
+            full length.
+        num_proc: Processes for the ``.map`` conversion.
+        cache_dir: Directory for the processed-dataset cache (with cache_key).
+        cache_key: Cache key (with cache_dir).
+        shuffle_seed: Seed for shuffling (mirrors build_eagle3_dataset).
+        min_reward: If set, drop rows whose ``reward_key`` is below this value
+            (optional curriculum / success-only filtering). Rows without the
+            reward column are kept.
+        input_ids_key: Column name for the token id sequence.
+        loss_mask_key: Column name for the loss mask sequence.
+        reward_key: Column name for the scalar reward (used by ``min_reward``).
+
+    Returns:
+        The processed HF dataset (torch-formatted).
+    """
+    columns = dataset.column_names
+    if input_ids_key not in columns or loss_mask_key not in columns:
+        raise ValueError(
+            f"Pretokenized dataset must contain '{input_ids_key}' and "
+            f"'{loss_mask_key}' columns; found: {columns}"
+        )
+
+    if min_reward is not None and reward_key in columns:
+        original_size = len(dataset)
+        dataset = dataset.filter(lambda x: (x[reward_key] is not None)
+                                 and (x[reward_key] >= min_reward))
+        print(
+            f"Reward-filtered pretokenized dataset (>= {min_reward}): "
+            f"{original_size} -> {len(dataset)} samples"
+        )
+
+    dataset = dataset.shuffle(seed=shuffle_seed)
+    original_cols = dataset.column_names
+
+    def preprocess_function(examples):
+        out = {"input_ids": [], "attention_mask": [], "loss_mask": []}
+        for ids, lm in zip(examples[input_ids_key], examples[loss_mask_key]):
+            ids = list(ids)
+            lm = list(lm)
+            if len(ids) != len(lm):
+                n = min(len(ids), len(lm))
+                ids, lm = ids[:n], lm[:n]
+            if max_length is not None:
+                ids = ids[:max_length]
+                lm = lm[:max_length]
+            t_ids = torch.tensor(ids, dtype=torch.long)[None, :]
+            t_lm = torch.tensor(lm, dtype=torch.long)[None, :]
+            out["input_ids"].append(t_ids)
+            out["loss_mask"].append(t_lm)
+            out["attention_mask"].append(torch.ones_like(t_lm))
+        return out
+
+    if cache_dir and cache_key:
+        load_from_cache_file = True
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
+        print(f"pretokenized dataset is cached at {cache_file_name}")
+    elif cache_dir is None and cache_key is None:
+        load_from_cache_file = False
+        cache_file_name = None
+        print("pretokenized dataset is not cached")
+    else:
+        warnings.warn(
+            "cache_dir and cache_key must be provided together to make caching work"
+        )
+        load_from_cache_file = False
+        cache_file_name = None
+
+    if num_proc is not None and num_proc > 1:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        num_proc=num_proc,
+        batch_size=1000,
+        remove_columns=original_cols,
+        load_from_cache_file=load_from_cache_file,
+        cache_file_name=cache_file_name,
+    )
+    dataset.set_format(type="torch")
+    return dataset
+
+
+# ==============================
 # Offline Eagle3 Dataset
 # ==============================
 # modified from https://github.com/NickL77/BaldEagle/blob/master/train/modules/data/data.py

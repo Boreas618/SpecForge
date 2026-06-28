@@ -26,7 +26,11 @@ from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+from specforge.data import (
+    build_dflash_pretokenized_dataset,
+    build_eagle3_dataset,
+    prepare_dp_dataloaders,
+)
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
@@ -122,6 +126,28 @@ def parse_args():
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
+    dataset_group.add_argument(
+        "--data-format",
+        type=str,
+        default="conversations",
+        choices=["conversations", "pretokenized"],
+        help=(
+            "Input data format. 'conversations' applies the chat template and "
+            "tokenizes (ShareGPT/preformatted). 'pretokenized' reads rows that "
+            "already carry parallel 'input_ids' and 'loss_mask' integer lists "
+            "(e.g. agentic SWE-bench rollouts), skipping chat-template parsing."
+        ),
+    )
+    dataset_group.add_argument(
+        "--min-reward",
+        type=float,
+        default=None,
+        help=(
+            "Only with --data-format pretokenized: drop rollout rows whose "
+            "'reward' is below this value (success-only / curriculum filtering). "
+            "Default keeps all trajectories."
+        ),
+    )
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
         "--build-dataset-num-proc",
@@ -255,35 +281,63 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"Data-parallel sharding over {'WORLD (dp-attention)' if use_dp_attention else 'DP group'}"
     )
 
-    cache_params_string = (
-        f"{args.train_data_path}-"
-        f"{args.max_length}-"
-        f"{args.chat_template}-"
-        f"{args.target_model_path}"
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        chat_template=args.chat_template,
-        max_length=args.max_length,
-        is_preformatted=args.is_preformatted,
-        cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-        cache_key=cache_key,
-        num_proc=args.build_dataset_num_proc,
-    )
-
     min_loss_tokens = 2 * args.block_size
-    original_size = len(train_eagle3_dataset)
-    train_eagle3_dataset = train_eagle3_dataset.filter(
-        lambda x: x["loss_mask"].sum() >= min_loss_tokens
-    )
-    print_on_rank0(
-        f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
-    )
 
+    def _cache_key_for(path: str) -> str:
+        if args.data_format == "pretokenized":
+            params = f"{path}-{args.max_length}-{args.min_reward}-pretok"
+        else:
+            params = (
+                f"{path}-"
+                f"{args.max_length}-"
+                f"{args.chat_template}-"
+                f"{args.target_model_path}"
+            )
+        return hashlib.md5(params.encode()).hexdigest()
+
+    def _build_split(path: str, split: str):
+        # Cache only the (large) train split on shared storage, matching the
+        # original behavior; eval is small and rebuilt each launch.
+        cache_dir = (
+            os.path.join(args.cache_dir, "processed_dataset")
+            if split == "train"
+            else None
+        )
+        cache_key = _cache_key_for(path) if split == "train" else None
+
+        raw = load_dataset("json", data_files=path)["train"]
+        if args.data_format == "pretokenized":
+            ds = build_dflash_pretokenized_dataset(
+                dataset=raw,
+                max_length=args.max_length,
+                num_proc=args.build_dataset_num_proc,
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                min_reward=args.min_reward,
+            )
+        else:
+            ds = build_eagle3_dataset(
+                dataset=raw,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                is_preformatted=args.is_preformatted,
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                num_proc=args.build_dataset_num_proc,
+            )
+
+        original_size = len(ds)
+        ds = ds.filter(lambda x: x["loss_mask"].sum() >= min_loss_tokens)
+        print_on_rank0(
+            f"Filtered {split} dataset ({args.data_format}): "
+            f"{original_size} -> {len(ds)} samples"
+        )
+        return ds
+
+    print_on_rank0(f"Building dataloaders with data_format={args.data_format}")
+
+    train_eagle3_dataset = _build_split(args.train_data_path, "train")
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.batch_size,
@@ -294,21 +348,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3_dataset = build_eagle3_dataset(
-            dataset=eval_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            is_preformatted=args.is_preformatted,
-        )
-        original_size = len(eval_eagle3_dataset)
-        eval_eagle3_dataset = eval_eagle3_dataset.filter(
-            lambda x: x["loss_mask"].sum() >= min_loss_tokens
-        )
-        print_on_rank0(
-            f"Filtered eval dataset: {original_size} -> {len(eval_eagle3_dataset)} samples"
-        )
+        eval_eagle3_dataset = _build_split(args.eval_data_path, "eval")
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,

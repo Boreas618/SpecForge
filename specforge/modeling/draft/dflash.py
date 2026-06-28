@@ -408,4 +408,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
+        # Expose per-step acceptance lengths (accepted draft tokens + 1 per
+        # block) for evaluation/benchmarking. Append-only; does not affect the
+        # return value or training (the trainer never calls spec_generate).
+        self._last_acceptance_lengths = list(acceptance_lengths)
+
         return output_ids
