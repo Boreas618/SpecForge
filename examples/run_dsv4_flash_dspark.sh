@@ -20,7 +20,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # moments on CPU so the sharded draft fits alongside the resident tp8 target.
 export SPECFORGE_OFFLOAD_MASTER=${SPECFORGE_OFFLOAD_MASTER:-1}
 
-TRAIN_DATA=${TRAIN_DATA:-$ROOT_DIR/cache/dataset/perfectblend_dsv4_250k.jsonl}
+TRAIN_DATA=${TRAIN_DATA:-$ROOT_DIR/cache/dataset/perfectblend.jsonl}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/outputs/dsv4-flash-dspark}
 DRAFT_CONFIG=${DRAFT_CONFIG:-$ROOT_DIR/configs/deepseek-v4-flash-dspark.json}
 MAX_STEPS=${MAX_STEPS:-}
@@ -29,9 +29,9 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 ACC_STEPS=${ACC_STEPS:-32}
 SAVE_INTERVAL=${SAVE_INTERVAL:-320}
 LOG_INTERVAL=${LOG_INTERVAL:-8}
-MAX_LEN=${MAX_LEN:-1024}
-NUM_ANCHORS=${NUM_ANCHORS:-48}
-MEM_FRAC=${MEM_FRAC:-0.3}
+MAX_LEN=${MAX_LEN:-4096}
+NUM_ANCHORS=${NUM_ANCHORS:-512}
+MEM_FRAC=${MEM_FRAC:-0.8}
 
 EXTRA=""; [ -n "$MAX_STEPS" ] && EXTRA="--max-steps $MAX_STEPS"
 
