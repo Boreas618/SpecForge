@@ -13,6 +13,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        offload_master=False,
     ):
         # TODO: For now, we only support cosine annealing warmup lr scheduler and AdamW optimizer
         # TODO: We should make these parameters configurable
@@ -21,8 +22,19 @@ class BF16Optimizer:
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        # Keep the fp32 master + AdamW moment buffers on CPU to free ~12 bytes/param
+        # of GPU memory (needed to fit very large sharded drafts alongside a
+        # resident target engine). Only the per-step grad copy + weight write-back
+        # cross the PCIe boundary; forward/backward stay fully on GPU.
+        self.offload_master = offload_master
+        master_device = "cpu" if offload_master else None
         self.fp32_params = [
-            p.detach().clone().to(torch.float32) for p in self.model_params
+            (
+                p.detach().to("cpu", torch.float32).clone()
+                if offload_master
+                else p.detach().clone().to(torch.float32)
+            )
+            for p in self.model_params
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
@@ -39,9 +51,11 @@ class BF16Optimizer:
     def step(self):
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                mp.grad = (
-                    p.grad.detach().to(torch.float32) if p.grad is not None else None
-                )
+                if p.grad is None:
+                    mp.grad = None
+                else:
+                    g = p.grad.detach().to(torch.float32)
+                    mp.grad = g.to("cpu") if self.offload_master else g
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         self.last_grad_norm = grad_norm.detach()
         self.optimizer.step()
@@ -49,7 +63,7 @@ class BF16Optimizer:
         self.scheduler.step()
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
-                p.data.copy_(mp.data.to(p.dtype))
+                p.data.copy_(mp.data.to(p.device, p.dtype))
                 p.grad = None
         return self.last_grad_norm
 

@@ -5,8 +5,22 @@ import sglang.srt.distributed.parallel_state as parallel_state
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import init_model_parallel_group
+from sglang.srt.distributed import init_model_parallel_group as _init_model_parallel_group
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+
+def init_model_parallel_group(*args, **kwargs):
+    """Call sglang's init_model_parallel_group, dropping kwargs this sglang
+    version does not accept (the signature is a moving target across revs)."""
+    import inspect
+
+    valid = set(inspect.signature(_init_model_parallel_group).parameters)
+    dropped = sorted(k for k in kwargs if k not in valid)
+    if dropped:
+        logger.warning("init_model_parallel_group: dropping unsupported %s", dropped)
+    return _init_model_parallel_group(
+        *args, **{k: v for k, v in kwargs.items() if k in valid}
+    )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     compute_dp_attention_local_info,
@@ -356,10 +370,13 @@ def initialize_dp_attention(
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     # NOTE: Added attn_cp_size parameter for sglang 0.5.9
+    # NOTE: newer sglang returns a 4th value (attn_dp_size); the if/else below
+    # sets _ATTN_DP_SIZE equivalently, so we just absorb it here.
     (
         dp_attention._ATTN_TP_RANK,
         dp_attention._ATTN_TP_SIZE,
         dp_attention._ATTN_DP_RANK,
+        _attn_dp_size_unused,
     ) = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )

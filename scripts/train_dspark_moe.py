@@ -26,6 +26,35 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
+# --- straggler/robustness patches (see run 2 fix playbook) ---
+# Per-rank compile caches (avoid 8-way file-lock contention on shared cache).
+_lr = os.environ.get("LOCAL_RANK", "0")
+_cb = os.environ.get("SPECFORGE_RANK_CACHE_BASE", "/tmp/sf_caches")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{_cb}/inductor_rank{_lr}")
+os.environ.setdefault("TRITON_CACHE_DIR", f"{_cb}/triton_rank{_lr}")
+# Force a generous timeout on every process group (kernel-compile stragglers
+# otherwise trip the 10-min torch default).
+from datetime import timedelta as _td  # noqa: E402
+from torch.distributed import distributed_c10d as _c10d  # noqa: E402
+
+_ong, _oip = _c10d.new_group, _c10d.init_process_group
+
+
+def _ng(*a, **k):
+    k["timeout"] = _td(minutes=45)
+    return _ong(*a, **k)
+
+
+def _ip(*a, **k):
+    k["timeout"] = _td(minutes=45)
+    return _oip(*a, **k)
+
+
+_c10d.new_group = _ng
+_c10d.init_process_group = _ip
+dist.new_group = _ng
+dist.init_process_group = _ip
 from accelerate.utils import set_seed
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -38,6 +67,7 @@ from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dspark import OnlineDSparkModel
+from specforge.modeling.draft.dspark_moe import DSparkMoEDraftModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dspark import DSparkDraftModel
@@ -71,8 +101,17 @@ def parse_args():
         "the 'hf' backend always surfaces it.",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
-    model_group.add_argument("--block-size", type=int, default=16)
-    model_group.add_argument("--num-draft-layers", type=int, default=1)
+    model_group.add_argument("--block-size", type=int, default=5)
+    model_group.add_argument("--num-draft-layers", type=int, default=8)
+    model_group.add_argument(
+        "--qwen-base",
+        type=str,
+        default="Qwen/Qwen3-8B",
+        help="Qwen3 config base (hidden 4096) for the verified dense-attention backbone.",
+    )
+    model_group.add_argument("--num-experts", type=int, default=128)
+    model_group.add_argument("--num-experts-per-tok", type=int, default=4)
+    model_group.add_argument("--moe-intermediate-size", type=int, default=1536)
     model_group.add_argument(
         "--mask-token-id",
         type=int,
@@ -254,35 +293,47 @@ def build_models(args, device) -> Tuple[DFlashTargetModel, DSparkDraftModel]:
         **target_model_kwargs,
     )
 
-    if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
-        print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
-        if (
-            hasattr(draft_config, "block_size")
-            and draft_config.block_size != args.block_size
-        ):
-            print_on_rank0(
-                f"Warning: config block_size ({draft_config.block_size}) differs from "
-                f"command-line arg ({args.block_size}). Using config value."
-            )
-    else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config.num_hidden_layers = args.num_draft_layers
-        draft_config.block_size = args.block_size
-        draft_config.num_target_layers = target_config.num_hidden_layers
-        print_on_rank0("Auto-generated draft config from target model")
-
-    if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
-        draft_config.dflash_config = {}
-
-    _apply_dspark_config(draft_config, args)
+    # Draft config = VERIFIED Qwen3 dense-attention backbone (from Qwen3-8B, the
+    # config the Qwen3-8B DSpark run validated) + standard Qwen3-MoE FFN, sized to
+    # match the released V4 drafter's scale (~19.85B total / ~1B active).
+    tgt_cfg = AutoConfig.from_pretrained(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
+    draft_config = AutoConfig.from_pretrained(args.qwen_base)
+    draft_config.vocab_size = tgt_cfg.vocab_size
+    draft_config.num_hidden_layers = args.num_draft_layers
+    # standard Qwen3-MoE FFN fields
+    draft_config.num_experts = args.num_experts
+    draft_config.num_experts_per_tok = args.num_experts_per_tok
+    draft_config.moe_intermediate_size = args.moe_intermediate_size
+    draft_config.norm_topk_prob = True
+    draft_config.decoder_sparse_step = 1
+    draft_config.mlp_only_layers = []
+    draft_config.layer_types = ["full_attention"] * args.num_draft_layers
+    draft_config._experts_implementation = "eager"
+    # DFlash / DSpark fields
+    draft_config.block_size = args.block_size
+    draft_config.num_target_layers = tgt_cfg.num_hidden_layers
+    draft_config.dflash_config = {
+        "target_layer_ids": [40, 41, 42],
+        "mask_token_id": args.mask_token_id,
+    }
+    draft_config.markov_rank = args.markov_rank
+    draft_config.markov_head_type = args.markov_head_type
+    draft_config.enable_confidence_head = args.enable_confidence_head
+    draft_config.confidence_head_with_markov = args.confidence_head_with_markov
     draft_config._attn_implementation = args.attention_backend
-    print_on_rank0(f"Using attention backend: {args.attention_backend}")
+    print_on_rank0(
+        f"Qwen3-MoE draft: layers={args.num_draft_layers} experts={args.num_experts} "
+        f"top{args.num_experts_per_tok} moe_inter={args.moe_intermediate_size} "
+        f"block_size={args.block_size} attn={args.attention_backend}"
+    )
 
-    draft_model = DSparkDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_model = DSparkMoEDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    draft_model._no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
+    print_on_rank0(f"Draft ACTIVE params/token ~= {draft_model.num_active_params/1e9:.2f}B")
 
     print_on_rank0(
         f"Draft config: block_size={draft_config.block_size}, "
@@ -387,15 +438,22 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
                 os.path.join(save_dir, "training_state.pt"),
             )
 
-            draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
+            # MoE draft is a plain nn.Module (no save_pretrained); save weights +
+            # its config JSON so it can be reconstructed.
+            from safetensors.torch import save_file
 
-            # Copy the modeling files next to the checkpoint so auto_map can
-            # resolve DSparkDraftModel (which subclasses DFlashDraftModel) on
-            # reload with trust_remote_code.
+            save_file(
+                {k: v.contiguous() for k, v in draft_state_dict.items()},
+                os.path.join(save_dir, "model.safetensors"),
+            )
+            try:
+                draft_model.config.to_json_file(os.path.join(save_dir, "config.json"))
+            except Exception:
+                pass
             modeling_dir = os.path.join(
                 os.path.dirname(__file__), "..", "specforge", "modeling", "draft"
             )
-            for fname in ("dspark.py", "dflash.py"):
+            for fname in ("dspark_moe.py", "dspark.py", "dflash.py"):
                 src = os.path.join(modeling_dir, fname)
                 if os.path.exists(src):
                     shutil.copy(src, os.path.join(save_dir, fname))
@@ -468,24 +526,19 @@ def main():
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
-    if draft_model_last_checkpoint:
-        checkpoint_config_path = os.path.join(
-            draft_model_last_checkpoint, "config.json"
-        )
-        if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
-            args.draft_config_path = checkpoint_config_path
-
     target_model, draft_model = build_models(args, device)
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DSparkDraftModel.from_pretrained(
-            draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+        # V4 draft is a plain nn.Module saved as model.safetensors.
+        from safetensors.torch import load_file
+
+        sd = load_file(
+            os.path.join(draft_model_last_checkpoint, "model.safetensors")
         )
-        draft_model.load_state_dict(loaded_model.state_dict())
-        del loaded_model
-        print("Loaded draft model weights from checkpoint")
+        draft_model.load_state_dict(sd, strict=False)
+        del sd
+        print(f"Loaded V4 draft weights from {draft_model_last_checkpoint}")
 
         training_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
@@ -511,9 +564,6 @@ def main():
     print_on_rank0(f"Using mask_token_id: {mask_token_id}")
 
     draft_model.mask_token_id = mask_token_id
-    draft_model.config.dflash_config["mask_token_id"] = mask_token_id
-    draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
-    print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
 
@@ -547,14 +597,14 @@ def main():
     # Wrap each transformer block as its own FSDP unit (compute/comm overlap).
     fsdp_kwargs = dict(
         use_orig_params=True,
-        forward_prefetch=True,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        forward_prefetch=False,
+        backward_prefetch=None,
         limit_all_gathers=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
     )
     block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
     block_classes = {
@@ -582,6 +632,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        offload_master=os.environ.get("SPECFORGE_OFFLOAD_MASTER", "0") == "1",
     )
 
     if resume_state is not None:
