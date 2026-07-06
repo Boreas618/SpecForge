@@ -168,6 +168,46 @@ class OnlineDSparkModel(OnlineDFlashModel):
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
+        return self._dspark_objective(
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            draft_hidden=draft_hidden,
+            last_hidden_states=last_hidden_states,
+        )
+
+    def _dspark_objective(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+    ]:
+        """Shared DSpark objective over the drafted block hidden states.
+
+        Given ``draft_hidden`` ``[B, n_blocks*block_size, hidden]`` (produced by
+        any DSpark backbone — the DFlash/Qwen3 dense draft or the faithful
+        DeepSeek-V4 draft), applies the frozen target ``lm_head`` + Markov head,
+        and computes the combined ce + L1 + confidence objective with DeepSpec's
+        pooled global-mean reduction. Backbone-agnostic: the anchor sampling,
+        noise stream, and attention masks are the caller's responsibility; from
+        the block hidden states onward the objective is identical across
+        backbones, so both wrappers reuse this method (single source of truth).
+        """
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        n_blocks = anchor_positions.shape[1]
         hidden_4d = draft_hidden.view(bsz, n_blocks, self.block_size, -1)
 
         base_logits = self.lm_head(draft_hidden)
@@ -256,6 +296,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_probs = torch.softmax(logits_4d.float(), dim=-1)
             target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
             l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)  # [B, nb, bs]
+            # Diagnostics (logged via loss_components; no effect on the loss).
+            with torch.no_grad():
+                _den = eval_mask.sum().clamp(min=1.0)
+                _t_arg = aligned_target_logits.argmax(-1)
+                self._probe_extras = {
+                    "agree_teacher": (
+                        ((logits_4d.argmax(-1) == _t_arg).float() * eval_mask).sum() / _den
+                    ),
+                    "teacher_top1_prob": (
+                        (target_probs.max(-1).values * eval_mask).sum() / _den
+                    ),
+                    "draft_top1_prob": (
+                        (draft_probs.max(-1).values * eval_mask).sum() / _den
+                    ),
+                }
             if self.l1_loss_alpha > 0:
                 l1_num = (l1_per_token * decay_weight_mask).sum()
             accept_rate = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
@@ -308,6 +363,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "l1_loss": (l1_num / local_den_eps).detach(),
             "confidence_loss": (conf_num / local_den_eps).detach(),
         }
+        loss_components.update(getattr(self, "_probe_extras", {}))
+        self._probe_extras = {}
 
         # ---- Metrics (cross-entropy based; all block_size slots are productive) ----
         with torch.no_grad():
