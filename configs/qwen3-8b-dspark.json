@@ -7,7 +7,7 @@
   "auto_map": {
     "AutoModel": "dspark.DSparkDraftModel"
   },
-  "block_size": 16,
+  "block_size": 7,
   "bos_token_id": 151643,
   "dflash_config": {
     "mask_token_id": 151669,
