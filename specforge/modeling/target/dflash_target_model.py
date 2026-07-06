@@ -86,6 +86,23 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         **kwargs,
     ) -> "SGLangDFlashTargetModel":
         tp_size = dist.get_world_size(get_tp_group())
+        # Drop kwargs this sglang version's ServerArgs does not know (the
+        # SGLangBackendArgs field set tracks a moving target).
+        import dataclasses as _dc
+
+        _valid = {f.name for f in _dc.fields(ServerArgs)}
+        _dropped = sorted(k for k in kwargs if k not in _valid)
+        if _dropped:
+            print(f"[SGLangDFlashTargetModel] dropping unsupported ServerArgs: {_dropped}")
+        kwargs = {k: v for k, v in kwargs.items() if k in _valid}
+        # Optional escape hatch for ServerArgs fields SpecForge does not plumb
+        # through its CLI (e.g. moe_runner_backend=deep_gemm for blockwise-FP8
+        # MoE models on Hopper, where the triton fused path rejects the layout).
+        import os as _os
+
+        _moe_backend = _os.environ.get("SPECFORGE_SGLANG_MOE_RUNNER_BACKEND")
+        if _moe_backend and "moe_runner_backend" in _valid:
+            kwargs["moe_runner_backend"] = _moe_backend
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
@@ -101,6 +118,16 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
 
+        # The Scheduler normally seeds the module-level MoE config (runner /
+        # a2a backend globals) from server_args; constructing ModelRunner
+        # directly skips that, leaving MOE_RUNNER_BACKEND stuck on AUTO.
+        try:
+            from sglang.srt.layers.moe import initialize_moe_config
+
+            initialize_moe_config(server_args)
+        except ImportError:
+            pass
+
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -114,6 +141,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             server_args=server_args,
             nccl_port=None,
         )
+        # Newer sglang moved KV/req pool creation out of ModelRunner.__init__
+        # into alloc_memory_pool() + init_attention_backends() + init_cuda_graphs()
+        # (normally invoked by the Scheduler in that order). init_cuda_graphs also
+        # builds the always-required eager_runner; with disable_cuda_graph=True the
+        # actual graph capture is skipped.
+        if (
+            getattr(model_runner, "req_to_token_pool", None) is None
+            and hasattr(model_runner, "alloc_memory_pool")
+        ):
+            model_runner.alloc_memory_pool()
+            if hasattr(model_runner, "init_attention_backends"):
+                model_runner.init_attention_backends()
+            if hasattr(model_runner, "init_cuda_graphs"):
+                model_runner.init_cuda_graphs()
         return cls(model_runner)
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
@@ -131,6 +172,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             page_size=self.model_runner.server_args.page_size,
         )
         tree_cache = RadixCache(cache_params)
+
+        for req in reqs:
+            req.init_next_round_input(tree_cache)
+            # Admit the full request in one shot (what PrefillAdder does for
+            # unchunked prefill); get_fill_ids() truncates by fill_len.
+            req.fill_len = len(req.prefix_indices) + req.extend_input_len
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -160,8 +207,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 offload_tags=set(),
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        # Newer sglang: ForwardBatch.init_new consumes the ScheduleBatch
+        # directly (no ModelWorkerBatch), and reads capture_hidden_mode from it.
+        # prepare_for_extend stages tokens in pinned CPU memory; materialize the
+        # device input_ids the way the scheduler does before building the FB.
+        if (
+            getattr(batch, "input_ids", None) is None
+            and getattr(batch, "prefill_input_ids_cpu", None) is not None
+        ):
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
         output = self.model_runner.forward(forward_batch)
@@ -181,7 +240,28 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             if hasattr(output, "hidden_states") and output.hidden_states is not None:
                 final_list = torch.split(output.hidden_states, input_lens, dim=0)
         elif hasattr(output, "hidden_states") and output.hidden_states is not None:
-            context_list = torch.split(output.hidden_states, input_lens, dim=0)
+            # Newer sglang stores the aux concat INTO .hidden_states under
+            # CaptureHiddenMode.FULL (no separate aux field). Our model patch
+            # appends the final post-norm hidden as the last capture entry, so
+            # the combined width is (k+1)*hidden — split context vs final here.
+            hs = output.hidden_states
+            k = len(self.capture_layer_ids or [])
+            if dist.get_rank() == 0 and not getattr(self, "_dbg_printed", False):
+                self._dbg_printed = True
+                print(
+                    f"[DEBUG _extend] hs_shape={tuple(hs.shape)} k={k} "
+                    f"hf_hidden={getattr(getattr(self.model_runner.model_config, 'hf_config', None), 'hidden_size', None)}"
+                )
+            hidden_size = getattr(
+                getattr(self.model_runner.model_config, "hf_config", None),
+                "hidden_size",
+                None,
+            ) or getattr(self.model_runner.model_config, "hidden_size", None)
+            if k and hidden_size and hs.shape[-1] == (k + 1) * hidden_size:
+                context_list = torch.split(hs[..., : k * hidden_size], input_lens, dim=0)
+                final_list = torch.split(hs[..., k * hidden_size :], input_lens, dim=0)
+            else:
+                context_list = torch.split(hs, input_lens, dim=0)
         else:
             raise ValueError("SGLang output does not contain hidden states.")
 
@@ -208,14 +288,18 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         for idx, (curr_ids, curr_attn, curr_loss) in enumerate(
             zip(input_ids_list, attn_mask_list, loss_mask_list)
         ):
+            from array import array as _array
+
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=curr_ids.view(-1).tolist(),
+                # Newer sglang types origin_input_ids as array("q") and
+                # concatenates it with array output_ids in _refresh_fill_ids.
+                origin_input_ids=_array("q", curr_ids.view(-1).tolist()),
                 sampling_params=sampling_params,
             )
-            req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            # fill_ids / extend_input_len are set via req.init_next_round_input()
+            # inside _extend (the official Req prefill protocol in newer sglang).
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
