@@ -57,6 +57,13 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
     final_mask = (mask_context | mask_draft) & valid_block
+    # SDPA NaN guard: queries of invalid (padded) blocks would otherwise have
+    # zero attendable keys — softmax over an all-masked row yields NaN (flex
+    # returns 0 instead), and NaN x 0 loss-weight still poisons gradients.
+    # Let every draft query attend at least itself; valid blocks already do
+    # (intra-block attention), and invalid blocks stay excluded from the loss.
+    self_attend = kv_indices - S == q_indices
+    final_mask = final_mask | self_attend
     return final_mask
 
 
