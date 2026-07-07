@@ -30,10 +30,12 @@ with :class:`DSparkV4Attention` (context K/V from ``main_x``, query/noise K/V fr
 the block stream), so the trained network matches the served forward.
 """
 
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention.flex_attention import flex_attention
 
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
@@ -50,7 +52,23 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     eager_attention_forward,
 )
 
+from torch.nn.attention.flex_attention import BlockMask  # noqa: E402
+
 from specforge.modeling.draft.dspark import VanillaMarkov
+
+# head_dim=512 forces small flex tiles on SM100 (larger OOMs shared memory; smaller
+# crashes). flash-attn-4 rejects symmetric head_dim=512 and the FA4 flex backend hits
+# a misaligned-address CUDA error, so the Triton flex kernel at BLOCK 32 is the only
+# stable fused option. Compiled once, reused across all draft layers.
+_FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": 32, "BLOCK_N": 32,
+    "BLOCK_M1": 32, "BLOCK_N1": 32,
+    "BLOCK_M2": 32, "BLOCK_N2": 32,
+}
+# dynamic=True: the draft query length Q and context S vary per batch (data-dependent
+# num_anchors); without it torch.compile re-traces flex on every new shape (GPU stalls
+# in inductor each step). Dynamic shapes compile once and reuse.
+_flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 
 
 class AcceptRateHead(nn.Module):
@@ -92,7 +110,7 @@ class DSparkV4Attention(DeepseekV4Attention):
         sin_q: torch.Tensor,
         cos_ctx: torch.Tensor,
         sin_ctx: torch.Tensor,
-        attention_mask: torch.Tensor,     # additive [B, 1, Q, S+Q]
+        attention_mask,                   # BlockMask (flex) or additive [B,1,Q,S+Q] (eager)
     ) -> torch.Tensor:
         B, Q, _ = hidden_states.shape
         S = context_hidden.shape[1]
@@ -112,15 +130,35 @@ class DSparkV4Attention(DeepseekV4Attention):
         kv_noise = apply_rotary_pos_emb(kv_noise, cos_q, sin_q)
         kv = torch.cat([kv_ctx, kv_noise], dim=2)  # [B, 1, S+Q, D], K == V
 
-        attn_output, _ = eager_attention_forward(
-            self,
-            q,
-            kv,
-            kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-        )  # [B, Q, num_heads, D]
+        if isinstance(attention_mask, BlockMask):
+            # Block-sparse flex attention: never materializes the [B,64,Q,S+Q] score
+            # matrix, so cost tracks the ~sliding_window keys actually attended, not S.
+            # GQA 64 query heads over the single shared KV head; K==V passed twice.
+            attn_out, lse = _flex_attention_compiled(
+                q,
+                kv,
+                kv,
+                block_mask=attention_mask,
+                scale=self.scaling,
+                enable_gqa=True,
+                return_lse=True,
+                kernel_options=_FLEX_KERNEL_OPTIONS,
+            )  # attn_out [B, num_heads, Q, D], lse [B, num_heads, Q]
+            # Per-head attention sink: eager appends a valueless sink logit as an extra
+            # softmax column, i.e. a post-hoc rescale by sigmoid(lse - sink) (exact;
+            # verified fp32 max-diff 6e-7). Keep lse attached so grads reach self.sinks.
+            corr = torch.sigmoid(lse - self.sinks.float().view(1, -1, 1)).to(attn_out.dtype)
+            attn_output = (attn_out * corr.unsqueeze(-1)).transpose(1, 2)  # [B, Q, num_heads, D]
+        else:
+            attn_output, _ = eager_attention_forward(
+                self,
+                q,
+                kv,
+                kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+            )  # [B, Q, num_heads, D]
 
         # K==V picked up RoPE on its trailing slice; undo it on the output rope
         # slice with the conjugate rotation (-sin) at the query (draft) positions.
@@ -217,6 +255,13 @@ class DSparkV4DraftModel(nn.Module):
         self.layers = nn.ModuleList(
             [DSparkV4Block(config, i) for i in range(self.num_layers)]
         )
+        # Optional torch.compile of each decoder block. The block is launch-bound
+        # (hyper-connection Sinkhorn iters + norms + mHC glue as many tiny kernels
+        # around the flex attention + grouped_mm MoE); fusing them cuts the per-step
+        # overhead. dynamic=True since Q/S vary per batch. Env SPECFORGE_COMPILE_DRAFT=1.
+        if os.environ.get("SPECFORGE_COMPILE_DRAFT") == "1":
+            for i in range(len(self.layers)):
+                self.layers[i] = torch.compile(self.layers[i], dynamic=True)
 
         # Head stack: learned hc_head collapse + final norm (pre-lm_head).
         self.hc_head = DeepseekV4HyperHead(config)
@@ -355,6 +400,14 @@ def build_dspark_v4_config(base: dict) -> DeepseekV4Config:
     ):
         if key in base:
             setattr(config, key, base[key])
+    # Fused grouped-GEMM experts. The transformers reference DeepseekV4Experts.forward
+    # is a Python loop over the 256 routed experts (torch.where/.nonzero() CPU syncs +
+    # index_add per expert); under gradient checkpointing its backward recomputes and
+    # backprops through 256*num_layers sync-bound tiny ops -> the draft backward is ~10x
+    # the forward (the training-throughput bottleneck). "grouped_mm" dispatches to one
+    # torch._grouped_mm over expert-sorted tokens (numerically equivalent to the loop:
+    # cosine 0.99999) for a ~10x faster backward. Overridable via config key.
+    config._experts_implementation = base.get("experts_implementation", "grouped_mm")
     return config
 
 
