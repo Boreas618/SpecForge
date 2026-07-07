@@ -103,6 +103,21 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         _moe_backend = _os.environ.get("SPECFORGE_SGLANG_MOE_RUNNER_BACKEND")
         if _moe_backend and "moe_runner_backend" in _valid:
             kwargs["moe_runner_backend"] = _moe_backend
+        # Bound host-RAM at load. The default safetensors loader runs 8 threads/rank
+        # (DEFAULT_NUM_THREADS) and every tp rank loads in parallel, so a large target
+        # (e.g. 274GB DeepSeek-V4-Flash-FP8 at tp4) buffers many 6GB shards at once ->
+        # a transient ~940GB host-RAM peak that trips OOM killers (earlyoom) even
+        # though weights are mmap'd. Serialize the per-rank load (one shard at a time)
+        # and drop the page cache after load so the peak stays bounded (~1 shard/rank).
+        # Override with SPECFORGE_SGLANG_SERIAL_LOAD=0.
+        if _os.environ.get("SPECFORGE_SGLANG_SERIAL_LOAD", "1") == "1":
+            if "model_loader_extra_config" in _valid:
+                kwargs.setdefault(
+                    "model_loader_extra_config",
+                    {"enable_multithread_load": False, "num_threads": 1},
+                )
+            if "weight_loader_drop_cache_after_load" in _valid:
+                kwargs.setdefault("weight_loader_drop_cache_after_load", True)
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
