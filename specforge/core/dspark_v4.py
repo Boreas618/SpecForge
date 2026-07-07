@@ -16,12 +16,20 @@ is the training-time equivalent of ``precompute_and_store_context_kv`` + the
 query-block forward.
 """
 
+import os
 from typing import Optional
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
 from specforge.core.dspark import OnlineDSparkModel
 from specforge.modeling.draft.dspark_v4 import DSparkV4DraftModel
+
+# "flex" (default): block-sparse flex attention over the dual-source + sliding-window
+# mask (skips the ~50x masked keys, no [B,64,Q,S+Q] score matrix). "eager": the dense
+# additive-bias fallback (kept for A/B correctness checks). Set SPECFORGE_DRAFT_ATTN=eager
+# to fall back.
+_DRAFT_ATTN = os.environ.get("SPECFORGE_DRAFT_ATTN", "flex")
 
 
 class OnlineDSparkV4Model(OnlineDSparkModel):
@@ -75,6 +83,41 @@ class OnlineDSparkV4Model(OnlineDSparkModel):
         bias.masked_fill_(~attend.unsqueeze(1), torch.finfo(dtype).min)
         return bias
 
+    def _build_dual_source_block_mask(
+        self,
+        anchor_positions: torch.Tensor,   # [B, N]
+        block_keep_mask: torch.Tensor,    # [B, N]
+        seq_len: int,
+        device: torch.device,
+    ):
+        """Block-sparse flex ``BlockMask`` [B, 1, N*bs, S+N*bs] — same semantics as the
+        additive :meth:`_build_dual_source_mask`, but flex skips the fully-masked key
+        blocks instead of materializing the dense score matrix. BLOCK_SIZE 32 is
+        mandatory at head_dim=512 on SM100 (see dspark_v4._FLEX_KERNEL_OPTIONS)."""
+        B, N = anchor_positions.shape
+        bs = self.block_size
+        Q = N * bs
+        S = seq_len
+        sw = getattr(self.draft_model, "sliding_window", None)
+        sw = int(sw) if sw else 0
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            qb = q_idx // bs
+            safe_qb = qb.clamp(max=N - 1)
+            anchor = anchor_positions[b, safe_qb]
+            keep = block_keep_mask[b, safe_qb]
+            p_abs = anchor + (q_idx - qb * bs)
+            ctx = (kv_idx < S) & (kv_idx < anchor)
+            if sw > 0:
+                ctx = ctx & (kv_idx > (p_abs - sw))
+            draft = (kv_idx >= S) & (qb == (kv_idx - S) // bs)
+            return (ctx | draft) & keep & (qb < N)
+
+        return create_block_mask(
+            mask_mod, B=B, H=None, Q_LEN=Q, KV_LEN=S + Q,
+            device=device, BLOCK_SIZE=(32, 32),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -104,16 +147,21 @@ class OnlineDSparkV4Model(OnlineDSparkModel):
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
         draft_position_ids = self._create_position_ids(anchor_positions)
-        attn_bias = self._build_dual_source_mask(
-            anchor_positions, block_keep_mask, seq_len, noise_embedding.dtype, device
-        )
+        if _DRAFT_ATTN == "flex":
+            attn_mask = self._build_dual_source_block_mask(
+                anchor_positions, block_keep_mask, seq_len, device
+            )
+        else:
+            attn_mask = self._build_dual_source_mask(
+                anchor_positions, block_keep_mask, seq_len, noise_embedding.dtype, device
+            )
 
         draft_hidden = self.draft_model(
             target_hidden=hidden_states,
             noise_embedding=noise_embedding,
             context_position_ids=context_position_ids,
             draft_position_ids=draft_position_ids,
-            attention_mask=attn_bias,
+            attention_mask=attn_mask,
         )
 
         return self._dspark_objective(
