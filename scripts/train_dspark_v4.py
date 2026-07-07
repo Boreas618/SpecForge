@@ -60,6 +60,7 @@ dist.init_process_group = _ip
 from accelerate.utils import set_seed  # noqa: E402
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: E402
 from torch.distributed.fsdp import (  # noqa: E402
+    BackwardPrefetch,
     MixedPrecision,
     ShardingStrategy,
     StateDictType,
@@ -191,10 +192,18 @@ def build_models(args, device, config_dict) -> Tuple[DFlashTargetModel, DSparkV4
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
 
+    # For the sglang backend the target is a quantized (fp8 / fp4+fp8) DeepSeek-V4
+    # checkpoint: forcing dtype=bfloat16 makes the loader mis-handle the native
+    # quantization (bf16<->fp8 downcast errors, and mis-resolving the MoE method
+    # for fp4-packed experts). Use "auto" so sglang respects the checkpoint's
+    # quantization_config. The HF backend still needs a concrete compute dtype.
+    target_torch_dtype = (
+        torch.bfloat16 if args.target_model_backend == "hf" else "auto"
+    )
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
         backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=target_torch_dtype,
         device=device.type if args.target_model_backend == "hf" else None,
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
@@ -426,15 +435,36 @@ def main():
         confidence_head_alpha=args.confidence_head_alpha,
     )
 
+    # FULL_SHARD is required here: BF16Optimizer builds its fp32 master + AdamW moments
+    # from model.parameters(), which are only SHARDED under FULL_SHARD (~60GB/rank).
+    # ZeRO-2/SHARD_GRAD_OP keeps params unsharded, so the optimizer would clone the full
+    # 19.85B params -> ~237GB fp32 master+moments -> OOM alongside the resident target.
+    # Instead recover FULL_SHARD's backward-overlap gap with prefetch: backward_prefetch
+    # =BACKWARD_PRE + forward_prefetch=True overlap the all-gathers with compute (they
+    # were fully serialized before, backward_prefetch=None — a big part of the slow bwd).
+    # Sharding strategy (env SPECFORGE_FSDP_STRATEGY):
+    #   full_shard (default): shards params+grads+opt. model.parameters() are sharded so
+    #     BF16Optimizer's fp32 master+moments are ~60GB/rank. But every block's 40GB expert
+    #     params are all-gathered in fwd AND re-all-gathered in bwd -> ~2s/step overhead
+    #     (single-GPU draft is only ~0.65s; FSDP adds the rest).
+    #   no_shard (DDP, DeepSpec's choice): params RESIDENT (no all-gather), grads all-reduced.
+    #     Removes the all-gather overhead but model.parameters() are the FULL 19.85B, so
+    #     BF16Optimizer clones ~237GB fp32 master+moments -> REQUIRES SPECFORGE_OFFLOAD_MASTER=1
+    #     (keeps them on CPU; ~237GB host RAM, fine).
+    _strat = {
+        "full_shard": ShardingStrategy.FULL_SHARD,
+        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+        "no_shard": ShardingStrategy.NO_SHARD,
+    }[os.environ.get("SPECFORGE_FSDP_STRATEGY", "full_shard")]
     fsdp_kwargs = dict(
         use_orig_params=True,
-        forward_prefetch=False,
-        backward_prefetch=None,
+        forward_prefetch=True,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         limit_all_gathers=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
         ),
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=_strat,
     )
     block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
     block_classes = {
@@ -459,12 +489,25 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state)
+        if os.environ.get("SPECFORGE_RESUME_FULL_OPTIM") == "1":
+            # Full resume incl. AdamW moments. Only correct if the checkpoint's flat-param
+            # sharding matches this run's exactly; under FSDP FULL_SHARD the raw per-shard
+            # AdamW state saved by BF16Optimizer does NOT reshard on a fresh wrap -> exp_avg
+            # vs grad size mismatch at optimizer.step(). Leave unset unless save/load is
+            # made FSDP-aware (FSDP.optim_state_dict).
+            optimizer.load_state_dict(resume_state)
+            print_on_rank0("Restored FULL optimizer + scheduler state")
+        else:
+            # Reshard-safe resume (default): restore the LR scheduler + step exactly, but
+            # reset the Adam moments (they re-warm in ~tens of steps, negligible mid-run).
+            # Avoids the FSDP flat-param reshard mismatch that crashes optimizer.step().
+            optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            print_on_rank0("Restored LR scheduler + step; Adam moments reset (reshard-safe)")
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
         print_on_rank0(
-            f"Restored optimizer/scheduler state: epoch={start_epoch}, step={global_step}"
+            f"Resumed training state: epoch={start_epoch}, step={global_step}"
         )
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
@@ -488,12 +531,23 @@ def main():
                 continue
             global_step += 1
 
+            _prof = os.environ.get("SPECFORGE_PROFILE_STEP") == "1" and dist.get_rank() == 0
+
+            def _psync(tag, t0):
+                if _prof:
+                    torch.cuda.synchronize()
+                    print(f"[PROFILE step {global_step}] {tag}: {time.time()-t0:.2f}s", flush=True)
+                    return time.time()
+                return t0
+
             input_ids = data["input_ids"].to(device, non_blocking=True)
             attention_mask = data["attention_mask"].to(device, non_blocking=True)
             loss_mask = data["loss_mask"].to(device, non_blocking=True)
+            _t = time.time()
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
+            _t = _psync("target_fwd", _t)
             hidden_states = target_output.hidden_states.to(device, non_blocking=True)
             last_hidden_states = target_output.last_hidden_states
             if last_hidden_states is not None:
@@ -519,8 +573,10 @@ def main():
                 loss_mask=loss_mask,
                 last_hidden_states=last_hidden_states,
             )
+            _t = _psync("draft_fwd", _t)
 
             (loss / args.accumulation_steps).backward()
+            _t = _psync("draft_bwd", _t)
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()
 
