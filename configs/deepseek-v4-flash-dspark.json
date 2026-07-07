@@ -51,5 +51,5 @@
   "markov_head_type": "vanilla",
   "enable_confidence_head": true,
   "confidence_head_with_markov": true,
-  "gradient_checkpointing": true
+  "gradient_checkpointing": false
 }
