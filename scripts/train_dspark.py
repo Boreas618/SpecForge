@@ -438,8 +438,12 @@ def save_checkpoint(args, epoch, step, dspark_model, draft_model, optimizer):
 
     with FSDP.state_dict_type(dspark_model, StateDictType.FULL_STATE_DICT):
         state_dict = dspark_model.state_dict()
+        # Strip both the torch.compile wrapper prefix (_orig_mod.) and the
+        # OnlineDSparkModel wrapper prefix (draft_model.) so the saved keys match
+        # a bare DSparkDraftModel on reload. Missing the _orig_mod. strip silently
+        # produces a checkpoint whose keys no reload can match -> random resume.
         draft_state_dict = {
-            k.replace("draft_model.", ""): v
+            k.replace("_orig_mod.", "").replace("draft_model.", ""): v
             for k, v in state_dict.items()
             if "draft_model." in k
         }
@@ -612,11 +616,39 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DSparkDraftModel.from_pretrained(
-            draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+        # Load weights straight from the checkpoint's safetensors, stripping any
+        # _orig_mod. (torch.compile wrapper) / draft_model. prefixes first, then
+        # validate. Going through from_pretrained silently drops keys carrying a
+        # _orig_mod. prefix (compile-era checkpoints) -> a fully random "resume".
+        import glob as _glob
+
+        from safetensors.torch import load_file as _load_sft
+
+        _sft = sorted(
+            _glob.glob(os.path.join(draft_model_last_checkpoint, "*.safetensors"))
         )
-        draft_model.load_state_dict(loaded_model.state_dict())
-        del loaded_model
+        if not _sft:
+            raise FileNotFoundError(
+                f"No .safetensors found in checkpoint {draft_model_last_checkpoint}"
+            )
+        _sd = {}
+        for _f in _sft:
+            for _k, _v in _load_sft(_f).items():
+                _ck = _k.replace("_orig_mod.", "").replace("draft_model.", "")
+                _sd[_ck] = _v.to(torch.bfloat16)
+        _missing, _unexpected = draft_model.load_state_dict(_sd, strict=False)
+        _n_expected = len(draft_model.state_dict())
+        if len(_missing) >= _n_expected:
+            raise RuntimeError(
+                f"Resume matched 0 params from {draft_model_last_checkpoint} "
+                f"({len(_missing)} missing / {len(_unexpected)} unexpected) — "
+                f"checkpoint key-prefix mismatch. Refusing to train a random draft."
+            )
+        if _missing or _unexpected:
+            print(
+                f"Resume: {len(_missing)} missing / {len(_unexpected)} unexpected keys "
+                f"(loaded {_n_expected - len(_missing)}/{_n_expected})"
+            )
         print("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
