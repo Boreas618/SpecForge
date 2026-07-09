@@ -248,7 +248,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device
         )
-        n_blocks = anchor_positions.shape[1]
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -655,6 +654,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         transient at nb=1024/V=155k. Kept as a fallback and as the reference for
         the chunked path's equivalence test.
         """
+        del chunk_blocks  # signature parity with _chunked_numerators
         bsz, n_blocks = hidden_4d.shape[:2]
         base_logits_4d = self.lm_head(
             hidden_4d.reshape(bsz, n_blocks * self.block_size, -1)
