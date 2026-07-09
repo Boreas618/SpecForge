@@ -271,10 +271,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         n_blocks = anchor_positions.shape[1]
         hidden_4d = draft_hidden.view(bsz, n_blocks, self.block_size, -1)
 
-        base_logits = self.lm_head(draft_hidden)
-        base_logits_4d = base_logits.view(bsz, n_blocks, self.block_size, -1)
-        vocab_size = base_logits_4d.size(-1)
-
         # ---- Labels + eval mask (DSpark / DeepSpec convention) ----
         # Slot j predicts the token at anchor+j+1 (the real anchor token seeds
         # slot 0). All block_size slots are supervised — there is no masked anchor
@@ -310,7 +306,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         decay_weight_mask = eval_mask * self._decay_weights(device)
         local_den = decay_weight_mask.sum()
 
-        # ---- Markov-biased draft logits ----
         # prev token for slot j is the ground-truth token immediately before the
         # one slot j predicts: slot 0's prev is the real anchor token, slot j's is
         # target_ids[j-1]. Matches DeepSpec prev_token_ids.
@@ -318,27 +313,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
         prev_token_ids = torch.cat(
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1
         )
-        logits_4d = base_logits_4d
-        if self.draft_model.markov_head is not None:
-            logits_4d = self.draft_model.markov_head.apply_block_logits(
-                base_logits_4d, token_ids=prev_token_ids
-            )
 
-        # ---- Cross entropy (hard labels) ----
-        flat_logits = logits_4d.reshape(-1, vocab_size)
-        flat_targets = target_ids.reshape(-1)
-        ce_per_token = F.cross_entropy(
-            flat_logits, flat_targets, reduction="none"
-        ).view(bsz, n_blocks, self.block_size)
-        ce_num = (ce_per_token * decay_weight_mask).sum()
-
-        # ---- L1 distribution distillation + accept rate ----
-        l1_num = base_logits.new_zeros((), dtype=torch.float32)
-        accept_rate = None
         need_target = (self.l1_loss_alpha > 0) or (
             self.draft_model.confidence_head is not None
             and self.confidence_head_alpha > 0
         )
+        aligned_hidden_4d = None
         if need_target:
             if last_hidden_states is None:
                 raise ValueError(
@@ -350,53 +330,38 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tgt_idx = (safe_label_indices - 1).clamp(min=0)  # [B, nb, bs]
             hdim = last_hidden_states.size(-1)
             gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
-            aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
-            aligned_target_logits = F.linear(aligned_hidden, self.lm_head.weight).view(
-                bsz, n_blocks, self.block_size, vocab_size
+            aligned_hidden_4d = torch.gather(last_hidden_states, 1, gather_idx).view(
+                bsz, n_blocks, self.block_size, hdim
             )
-            draft_probs = torch.softmax(logits_4d.float(), dim=-1)
-            target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)  # [B, nb, bs]
-            # Diagnostics (logged via loss_components; no effect on the loss).
-            with torch.no_grad():
-                _den = eval_mask.sum().clamp(min=1.0)
-                _t_arg = aligned_target_logits.argmax(-1)
-                self._probe_extras = {
-                    "agree_teacher": (
-                        ((logits_4d.argmax(-1) == _t_arg).float() * eval_mask).sum() / _den
-                    ),
-                    "teacher_top1_prob": (
-                        (target_probs.max(-1).values * eval_mask).sum() / _den
-                    ),
-                    "draft_top1_prob": (
-                        (draft_probs.max(-1).values * eval_mask).sum() / _den
-                    ),
-                }
-            if self.l1_loss_alpha > 0:
-                l1_num = (l1_per_token * decay_weight_mask).sum()
-            accept_rate = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
 
-        # ---- Confidence head BCE ----
-        conf_num = base_logits.new_zeros((), dtype=torch.float32)
-        if (
-            self.draft_model.confidence_head is not None
-            and self.confidence_head_alpha > 0
-        ):
-            if self.draft_model.confidence_head_with_markov:
-                prev_emb = self.draft_model.markov_head.get_prev_embeddings(
-                    prev_token_ids
-                ).to(hidden_4d.dtype)
-                conf_features = torch.cat([hidden_4d, prev_emb], dim=-1)
-            else:
-                conf_features = hidden_4d
-            confidence_pred = self.draft_model.confidence_head(conf_features).float()
-            conf_bce = (
-                F.binary_cross_entropy_with_logits(
-                    confidence_pred, accept_rate.detach(), reduction="none"
-                )
-                * decay_weight_mask
-            )
-            conf_num = conf_bce.sum()
+        # Numerators + metrics. The chunked path (default) processes the block dim
+        # in slices with recompute-in-backward so the [B, nb, bs, V] float tensors
+        # (V=155k) never materialize at full nb — the unchunked path peaks at
+        # ~30 GB at nb=1024 and OOMs next to the sglang pool. Set
+        # SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=0 to force the legacy path.
+        chunk_blocks = int(os.environ.get("SPECFORGE_OBJECTIVE_CHUNK_BLOCKS", "128"))
+        numerators_fn = (
+            self._chunked_numerators if chunk_blocks > 0 else self._full_numerators
+        )
+        (
+            ce_num,
+            l1_num,
+            conf_num,
+            probe_extras,
+            correct_sum,
+            ce_pp,
+            acc_pp_correct,
+            count_per_position,
+        ) = numerators_fn(
+            hidden_4d=hidden_4d,
+            prev_token_ids=prev_token_ids,
+            target_ids=target_ids,
+            decay_weight_mask=decay_weight_mask,
+            eval_mask=eval_mask,
+            aligned_hidden_4d=aligned_hidden_4d,
+            chunk_blocks=chunk_blocks,
+        )
+        self._probe_extras = probe_extras
 
         # ---- Pooled global loss (DeepSpec _build_loss) ----
         # Local numerators over a cross-rank-summed denominator, x world_size to
@@ -418,7 +383,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         # Fires only when the loss is already broken -> no cost on the healthy
         # path. Pinpoints which numerator went non-finite and whether the draft
-        # logits / target hidden are the source (vs a degenerate denominator).
+        # hidden / target hidden are the source (vs a degenerate denominator).
         if not bool(torch.isfinite(loss)):
             _r = dist.get_rank() if dist.is_initialized() else 0
             print(
@@ -427,7 +392,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 f"conf_num={float(conf_num):.3e} "
                 f"local_den={float(local_den):.3e} global_den={float(global_den):.3e} | "
                 f"{_finite_report('draft_hidden', draft_hidden)} | "
-                f"{_finite_report('base_logits', base_logits)} | "
                 f"{_finite_report('last_hidden', last_hidden_states)}",
                 flush=True,
             )
@@ -445,18 +409,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         # ---- Metrics (cross-entropy based; all block_size slots are productive) ----
         with torch.no_grad():
-            flat_binary = eval_mask.reshape(-1)
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (flat_binary > 0.5)
-            accuracy = correct.sum().float() / flat_binary.sum().clamp(min=1e-6)
-
-            count_per_position = eval_mask.sum(dim=(0, 1))
+            accuracy = correct_sum.float() / eval_mask.sum().clamp(min=1e-6)
             count_pp = count_per_position.clamp(min=1.0)
-            loss_per_position = (ce_per_token * eval_mask).sum(dim=(0, 1)) / count_pp
-            acc_per_position = (
-                correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
-                / count_pp
-            )
+            loss_per_position = ce_pp / count_pp
+            acc_per_position = acc_pp_correct / count_pp
 
         return (
             loss,
@@ -465,4 +421,258 @@ class OnlineDSparkModel(OnlineDFlashModel):
             acc_per_position,
             count_per_position,
             loss_components,
+        )
+
+    def _chunk_terms(
+        self,
+        dh: torch.Tensor,  # [B, cb, bs, h] draft hidden slice (grad)
+        prev_ids: torch.Tensor,  # [B, cb, bs]
+        tids: torch.Tensor,  # [B, cb, bs]
+        w: torch.Tensor,  # [B, cb, bs] decay*eval weights
+        ev: torch.Tensor,  # [B, cb, bs] eval mask
+        ah: Optional[torch.Tensor],  # [B, cb, bs, h] aligned target hidden or None
+    ) -> Tuple[torch.Tensor, ...]:
+        """Objective terms for one slice of the block dim.
+
+        Ops match the legacy full-materialization path 1:1 (only summed over a
+        slice instead of all blocks), so Σ over chunks reproduces the legacy
+        numerators up to fp reassociation.
+        """
+        markov = self.draft_model.markov_head
+        conf_head = self.draft_model.confidence_head
+        use_conf = conf_head is not None and self.confidence_head_alpha > 0
+        hdim = dh.size(-1)
+
+        # NOTE: all vocab-sized linears are flattened to 2D first. On sliced 4D
+        # inputs (chunk views) cuBLAS picks a degenerate batched-GEMM kernel
+        # (M=block_size per batch) that is ~35x slower than the flat GEMM.
+        base = F.linear(dh.reshape(-1, hdim), self.lm_head.weight).view(
+            *dh.shape[:-1], -1
+        )
+        lg = base
+        if markov is not None:
+            # == markov.apply_block_logits(base, token_ids=prev_ids), flattened.
+            bias = markov.project_bias(
+                markov.get_prev_embeddings(prev_ids.reshape(-1))
+            ).view_as(base)
+            lg = base + bias
+        vocab_size = lg.size(-1)
+        ce = F.cross_entropy(
+            lg.reshape(-1, vocab_size), tids.reshape(-1), reduction="none"
+        ).view(tids.shape)
+        ce_num = (ce * w).sum()
+
+        zero = base.new_zeros((), dtype=torch.float32)
+        l1_num, conf_num = zero, zero
+        accept_rate = None
+        p = q = t_arg = None
+        if ah is not None:
+            with torch.no_grad():
+                tl = (
+                    F.linear(ah.reshape(-1, hdim), self.lm_head.weight)
+                    .view_as(lg)
+                    .float()
+                )
+                q = torch.softmax(tl, dim=-1)
+                t_arg = tl.argmax(-1)
+            p = torch.softmax(lg.float(), dim=-1)
+            l1_tok = (p - q).abs().sum(dim=-1)
+            if self.l1_loss_alpha > 0:
+                l1_num = (l1_tok * w).sum()
+            accept_rate = (1.0 - 0.5 * l1_tok).clamp(0.0, 1.0)
+        if use_conf:
+            feats = dh
+            if self.draft_model.confidence_head_with_markov:
+                prev_emb = markov.get_prev_embeddings(prev_ids).to(dh.dtype)
+                feats = torch.cat([dh, prev_emb], dim=-1)
+            conf_pred = conf_head(feats).float()
+            conf_num = (
+                F.binary_cross_entropy_with_logits(
+                    conf_pred, accept_rate.detach(), reduction="none"
+                )
+                * w
+            ).sum()
+
+        with torch.no_grad():
+            pred = lg.argmax(-1)
+            correct = ((pred == tids) & (ev > 0.5)).float()
+            correct_sum = correct.sum()
+            ce_pp = (ce.detach() * ev).sum(dim=(0, 1))  # [bs]
+            acc_pp = correct.sum(dim=(0, 1))  # [bs]
+            if ah is not None:
+                agree = ((pred == t_arg).float() * ev).sum()
+                ttop = (q.max(-1).values * ev).sum()
+                dtop = (p.max(-1).values * ev).sum()
+            else:
+                agree = ttop = dtop = zero
+        return ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp, agree, ttop, dtop
+
+    def _chunked_numerators(
+        self,
+        *,
+        hidden_4d: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+        decay_weight_mask: torch.Tensor,
+        eval_mask: torch.Tensor,
+        aligned_hidden_4d: Optional[torch.Tensor],
+        chunk_blocks: int,
+    ):
+        """Chunked objective: slice the block dim, recompute in backward.
+
+        Peak memory ~= one chunk's [B, cb, bs, V] tensors (~2-3 GB at cb=128)
+        instead of the full-nb ~30 GB stack; checkpointing saves only the chunk
+        INPUTS ([B, cb, bs, h] views — negligible) so backward memory drops the
+        same way. Recompute cost is one extra chunk forward (~ms; the run is
+        target-prefill-bound).
+        """
+        import torch.utils.checkpoint as _ckpt
+
+        n_blocks = hidden_4d.shape[1]
+        use_ckpt = torch.is_grad_enabled() and hidden_4d.requires_grad
+        acc = None
+        for s in range(0, n_blocks, chunk_blocks):
+            e = min(s + chunk_blocks, n_blocks)
+            chunk_args = (
+                hidden_4d[:, s:e],
+                prev_token_ids[:, s:e],
+                target_ids[:, s:e],
+                decay_weight_mask[:, s:e],
+                eval_mask[:, s:e],
+                aligned_hidden_4d[:, s:e] if aligned_hidden_4d is not None else None,
+            )
+            if use_ckpt:
+                out = _ckpt.checkpoint(
+                    self._chunk_terms, *chunk_args, use_reentrant=False
+                )
+            else:
+                out = self._chunk_terms(*chunk_args)
+            acc = out if acc is None else tuple(a + o for a, o in zip(acc, out))
+
+        ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp, agree, ttop, dtop = acc
+        probe_extras = {}
+        if aligned_hidden_4d is not None:
+            with torch.no_grad():
+                _den = eval_mask.sum().clamp(min=1.0)
+                probe_extras = {
+                    "agree_teacher": agree / _den,
+                    "teacher_top1_prob": ttop / _den,
+                    "draft_top1_prob": dtop / _den,
+                }
+        count_per_position = eval_mask.sum(dim=(0, 1))
+        return (
+            ce_num,
+            l1_num,
+            conf_num,
+            probe_extras,
+            correct_sum,
+            ce_pp,
+            acc_pp,
+            count_per_position,
+        )
+
+    def _full_numerators(
+        self,
+        *,
+        hidden_4d: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+        decay_weight_mask: torch.Tensor,
+        eval_mask: torch.Tensor,
+        aligned_hidden_4d: Optional[torch.Tensor],
+        chunk_blocks: int,  # unused; signature parity
+    ):
+        """Legacy full-materialization path (SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=0).
+
+        Materializes the full [B, nb, bs, V] logits/probs stack — needs ~30 GB
+        transient at nb=1024/V=155k. Kept as a fallback and as the reference for
+        the chunked path's equivalence test.
+        """
+        bsz, n_blocks = hidden_4d.shape[:2]
+        base_logits_4d = self.lm_head(
+            hidden_4d.reshape(bsz, n_blocks * self.block_size, -1)
+        ).view(bsz, n_blocks, self.block_size, -1)
+        vocab_size = base_logits_4d.size(-1)
+
+        logits_4d = base_logits_4d
+        if self.draft_model.markov_head is not None:
+            logits_4d = self.draft_model.markov_head.apply_block_logits(
+                base_logits_4d, token_ids=prev_token_ids
+            )
+
+        flat_logits = logits_4d.reshape(-1, vocab_size)
+        flat_targets = target_ids.reshape(-1)
+        ce_per_token = F.cross_entropy(
+            flat_logits, flat_targets, reduction="none"
+        ).view(bsz, n_blocks, self.block_size)
+        ce_num = (ce_per_token * decay_weight_mask).sum()
+
+        zero = base_logits_4d.new_zeros((), dtype=torch.float32)
+        l1_num, conf_num = zero, zero
+        accept_rate = None
+        probe_extras = {}
+        if aligned_hidden_4d is not None:
+            aligned_target_logits = F.linear(
+                aligned_hidden_4d, self.lm_head.weight
+            )
+            draft_probs = torch.softmax(logits_4d.float(), dim=-1)
+            target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
+            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+            with torch.no_grad():
+                _den = eval_mask.sum().clamp(min=1.0)
+                _t_arg = aligned_target_logits.argmax(-1)
+                probe_extras = {
+                    "agree_teacher": (
+                        ((logits_4d.argmax(-1) == _t_arg).float() * eval_mask).sum()
+                        / _den
+                    ),
+                    "teacher_top1_prob": (
+                        (target_probs.max(-1).values * eval_mask).sum() / _den
+                    ),
+                    "draft_top1_prob": (
+                        (draft_probs.max(-1).values * eval_mask).sum() / _den
+                    ),
+                }
+            if self.l1_loss_alpha > 0:
+                l1_num = (l1_per_token * decay_weight_mask).sum()
+            accept_rate = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+
+        if (
+            self.draft_model.confidence_head is not None
+            and self.confidence_head_alpha > 0
+        ):
+            if self.draft_model.confidence_head_with_markov:
+                prev_emb = self.draft_model.markov_head.get_prev_embeddings(
+                    prev_token_ids
+                ).to(hidden_4d.dtype)
+                conf_features = torch.cat([hidden_4d, prev_emb], dim=-1)
+            else:
+                conf_features = hidden_4d
+            confidence_pred = self.draft_model.confidence_head(conf_features).float()
+            conf_num = (
+                F.binary_cross_entropy_with_logits(
+                    confidence_pred, accept_rate.detach(), reduction="none"
+                )
+                * decay_weight_mask
+            ).sum()
+
+        with torch.no_grad():
+            pred_ids = torch.argmax(flat_logits, dim=-1)
+            flat_binary = eval_mask.reshape(-1)
+            correct = (pred_ids == flat_targets) & (flat_binary > 0.5)
+            correct_sum = correct.sum()
+            correct_3d = correct.view(bsz, n_blocks, self.block_size).float()
+            ce_pp = (ce_per_token.detach() * eval_mask).sum(dim=(0, 1))
+            acc_pp = correct_3d.sum(dim=(0, 1))
+            count_per_position = eval_mask.sum(dim=(0, 1))
+
+        return (
+            ce_num,
+            l1_num,
+            conf_num,
+            probe_extras,
+            correct_sum,
+            ce_pp,
+            acc_pp,
+            count_per_position,
         )

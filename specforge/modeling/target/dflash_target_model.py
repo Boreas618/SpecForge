@@ -359,12 +359,17 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         ):
             from array import array as _array
 
+            # Strip right padding (the collator pads right): prefilling pad
+            # tokens through the target wastes prefill compute at batch > 1 and
+            # produces garbage hiddens no one reads (loss_mask is 0 there and
+            # the draft's block mask only attends context <= anchor < true_len).
+            true_len = max(int(curr_attn.view(-1).sum().item()), 1)
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
                 # Newer sglang types origin_input_ids as array("q") and
                 # concatenates it with array output_ids in _refresh_fill_ids.
-                origin_input_ids=_array("q", curr_ids.view(-1).tolist()),
+                origin_input_ids=_array("q", curr_ids.view(-1)[:true_len].tolist()),
                 sampling_params=sampling_params,
             )
             # fill_ids / extend_input_len are set via req.init_next_round_input()
@@ -374,11 +379,21 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
         context_list, final_list = self._extend(reqs)
 
-        # Stack back to batch
-        hidden_states = torch.cat([h.unsqueeze(0) for h in context_list], dim=0)
+        # Stack back to batch, re-padding each row to the batch seq length
+        # (requests were prefetched pad-stripped; zeros at pad positions are
+        # never read — loss_mask is 0 there and blocks only attend <= anchor).
+        seq_len = input_ids.size(1)
+
+        def _repad(h: torch.Tensor) -> torch.Tensor:
+            if h.size(0) == seq_len:
+                return h
+            pad = h.new_zeros(seq_len - h.size(0), h.size(1))
+            return torch.cat([h, pad], dim=0)
+
+        hidden_states = torch.stack([_repad(h) for h in context_list], dim=0)
         last_hidden_states = None
         if final_list is not None:
-            last_hidden_states = torch.cat([h.unsqueeze(0) for h in final_list], dim=0)
+            last_hidden_states = torch.stack([_repad(h) for h in final_list], dim=0)
         input_ids = torch.cat([d[0] for d in data_cache], dim=0)
         attention_mask = torch.cat([d[1] for d in data_cache], dim=0)
         loss_mask = torch.cat([d[2] for d in data_cache], dim=0)
