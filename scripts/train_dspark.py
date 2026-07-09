@@ -400,10 +400,28 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
     data_parallel_group = None if use_dp_attention else get_dp_group()
 
+    # Load data IN-PROCESS (num_workers=0). A fork()ed DataLoader worker inherits
+    # wandb's public-API service object from the wandb-initialised main process;
+    # its weakref finalizer fires on the first in-worker GC (mid-batch, while
+    # holding the import lock) and blocks forever on the dead service socket. That
+    # worker never yields its batch -> the rank stalls at the dataloader -> the
+    # target's tp collective on the peer ranks deadlocks. (Exactly why the
+    # REPORT_TO=none smoke passed but the REPORT_TO=wandb run hung at step ~47.)
+    # `spawn` workers avoid the inherit but re-exec this heavy module per worker
+    # and are fragile here; the workload is target-prefill-bound and the data is
+    # pre-tokenised (Arrow mmap), so in-process loading costs ~1-2%/step.
+    num_workers = 0
+    if args.dataloader_num_workers > 0:
+        print_on_rank0(
+            f"DSpark: forcing dataloader num_workers=0 (requested "
+            f"{args.dataloader_num_workers}) to avoid the wandb + forked-worker "
+            f"deadlock; data is pre-tokenised so the cost is negligible."
+        )
+
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.batch_size,
-        num_workers=args.dataloader_num_workers,
+        num_workers=num_workers,
         shuffle=True,
         process_group=data_parallel_group,
     )
@@ -421,7 +439,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.batch_size,
-            num_workers=args.dataloader_num_workers,
+            num_workers=num_workers,
             shuffle=False,
             process_group=data_parallel_group,
         )
