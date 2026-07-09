@@ -38,13 +38,15 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 NNODES=${NNODES:-4}
 NUM_GPUS=${NUM_GPUS:-4}                    # per node — a GB300 node is 4 GPUs
 WORLD=$((NNODES * NUM_GPUS))               # = 16
-# APPROACH 1 (default): genuine DP via sglang DP-attention + DeepEP across all WORLD
+# APPROACH 2 (DEFAULT): one per-NODE tp engine (intra-node NVLink target, no
+#   DeepEP) + cross-node data-parallel over the draft's FSDP (NCCL, TCP if no IB).
+#   -> NNODES unique streams. This is the validated topology in this container
+#   (no /dev/infiniband; DeepEP forces IBGDA which hangs cross-container here).
+# APPROACH 1 (opt-in): genuine DP via sglang DP-attention + DeepEP across all WORLD
 #   ranks -> ~16 unique data streams. REQUIRES cross-node InfiniBand verbs
 #   (/dev/infiniband); DeepEP/NVSHMEM cannot init otherwise (IBGDA/IBRC fail).
-# APPROACH 2 (fallback, no IB): one per-NODE tp engine (intra-node NVLink target, no
-#   DeepEP) + cross-node data-parallel over the draft's FSDP (NCCL, TCP if no IB).
-#   -> NNODES unique streams. Use when /dev/infiniband is absent in the container.
-APPROACH=${APPROACH:-1}
+#   Set APPROACH=1 only after the devbox is relaunched with RDMA.
+APPROACH=${APPROACH:-2}
 if [ "$APPROACH" = "2" ]; then DATA_STREAMS=$NNODES; else DATA_STREAMS=$WORLD; fi
 MASTER_ADDR=${MASTER_ADDR:-10.41.203.21}   # rank-0 routable IP (rendezvous)
 MASTER_PORT=${MASTER_PORT:-29500}
@@ -190,6 +192,13 @@ cmd_train() {
   # grad vs full param) in Qwen3RMSNorm. Eager is validated + stable; the run is
   # target-bound so compile is marginal. Set =1 only after the FSDP-recompile fix.
   export SPECFORGE_COMPILE_DRAFT=${SPECFORGE_COMPILE_DRAFT:-0}
+  # Non-finite robustness: drop non-finite tokens from supervision + zero their
+  # hidden (default ON here) so one rare bad FP8-target-capture sample cannot
+  # NaN-poison all ranks via the grad all-reduce over a 10-epoch/1.5M run. The
+  # [NONFINITE-*]/[SANITIZE] diagnostics still log every occurrence + its rate.
+  # Set =0 to instead crash on a bad sample (to catch it).
+  export SPECFORGE_SANITIZE_NONFINITE=${SPECFORGE_SANITIZE_NONFINITE:-1}
+  export SPECFORGE_DEBUG_NONFINITE=${SPECFORGE_DEBUG_NONFINITE:-1}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
   # Draft attention: Triton flex (handles the data-dependent dual-source BlockMask).
