@@ -37,7 +37,15 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 # ---- topology knobs -------------------------------------------------------
 NNODES=${NNODES:-4}
 NUM_GPUS=${NUM_GPUS:-4}                    # per node — a GB300 node is 4 GPUs
-WORLD=$((NNODES * NUM_GPUS))               # = 16; tp = ep = dp = WORLD (DP-attention)
+WORLD=$((NNODES * NUM_GPUS))               # = 16
+# APPROACH 1 (default): genuine DP via sglang DP-attention + DeepEP across all WORLD
+#   ranks -> ~16 unique data streams. REQUIRES cross-node InfiniBand verbs
+#   (/dev/infiniband); DeepEP/NVSHMEM cannot init otherwise (IBGDA/IBRC fail).
+# APPROACH 2 (fallback, no IB): one per-NODE tp engine (intra-node NVLink target, no
+#   DeepEP) + cross-node data-parallel over the draft's FSDP (NCCL, TCP if no IB).
+#   -> NNODES unique streams. Use when /dev/infiniband is absent in the container.
+APPROACH=${APPROACH:-1}
+if [ "$APPROACH" = "2" ]; then DATA_STREAMS=$NNODES; else DATA_STREAMS=$WORLD; fi
 MASTER_ADDR=${MASTER_ADDR:-10.41.203.21}   # rank-0 routable IP (rendezvous)
 MASTER_PORT=${MASTER_PORT:-29500}
 # Other nodes (for optional rank0->node checkpoint/data sync). rank order 0..3.
@@ -47,7 +55,7 @@ RANK_HOSTS=${RANK_HOSTS:-"10.41.203.23 10.41.202.251 10.41.203.9"}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 BATCH_SIZE=${BATCH_SIZE:-1}                # per-rank micro-batch
 GLOBAL_BATCH=${GLOBAL_BATCH:-512}
-ACC_STEPS=${ACC_STEPS:-$(( GLOBAL_BATCH / (WORLD * BATCH_SIZE) ))}   # = 32 at WORLD16/BS1
+ACC_STEPS=${ACC_STEPS:-$(( GLOBAL_BATCH / (DATA_STREAMS * BATCH_SIZE) ))}   # A1: 512/16=32 ; A2: 512/4=128
 LEARNING_RATE=${LEARNING_RATE:-6e-4}
 WARMUP_RATIO=${WARMUP_RATIO:-0.04}
 MAX_LEN=${MAX_LEN:-4096}
@@ -210,10 +218,24 @@ cmd_train() {
   local tracker=(--report-to "$REPORT_TO")
   [ "$REPORT_TO" = "wandb" ] && tracker+=(--wandb-project "$WANDB_PROJECT" --wandb-name "$WANDB_NAME")
 
+  # Target parallelism per APPROACH (topology note above).
+  local tp_size
+  local -a PAR_FLAGS
+  if [ "$APPROACH" = "2" ]; then
+    tp_size=$NUM_GPUS                              # one tp engine per node (intra-node NVLink target)
+    PAR_FLAGS=()                                   # no DP-attention, no DeepEP -> no cross-node IB needed
+    export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}   # no IB verbs -> NCCL over TCP for cross-node draft FSDP
+    MEM_FRAC=${MEM_FRAC_A2:-0.78}                  # target ~189GB/rank at tp=NUM_GPUS -> high fraction
+  else
+    tp_size=$WORLD
+    PAR_FLAGS=(--sglang-dp-size "$WORLD" --sglang-ep-size "$WORLD"
+               --sglang-enable-dp-attention --sglang-moe-a2a-backend deepep)
+  fi
+
   mkdir -p "$OUTPUT_DIR"
-  log "train: node_rank=$NODE_RANK/$NNODES world=$WORLD master=$MASTER_ADDR:$MASTER_PORT \
-bs=$BATCH_SIZE acc=$ACC_STEPS (eff. global batch=$((WORLD * BATCH_SIZE * ACC_STEPS))) \
-attn=$SGLANG_ATTN_BACKEND iface=$NCCL_SOCKET_IFNAME"
+  log "train: APPROACH=$APPROACH node_rank=$NODE_RANK/$NNODES world=$WORLD tp=$tp_size \
+streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_STEPS \
+(eff. global batch=$((DATA_STREAMS * BATCH_SIZE * ACC_STEPS))) attn=$SGLANG_ATTN_BACKEND iface=$NCCL_SOCKET_IFNAME"
 
   # STATIC rendezvous (node-rank 0 hosts the TCPStore at MASTER_ADDR:MASTER_PORT).
   # c10d host election calls _matches_machine_hostname(MASTER_ADDR) which is False
@@ -224,9 +246,8 @@ attn=$SGLANG_ATTN_BACKEND iface=$NCCL_SOCKET_IFNAME"
     --max-restarts "$MAX_RESTARTS" \
     "$ROOT_DIR/scripts/train_dspark.py" \
     --target-model-path "$TARGET_MODEL" --trust-remote-code \
-    --target-model-backend sglang --tp-size "$WORLD" \
-    --sglang-dp-size "$WORLD" --sglang-ep-size "$WORLD" \
-    --sglang-enable-dp-attention --sglang-moe-a2a-backend deepep \
+    --target-model-backend sglang --tp-size "$tp_size" \
+    "${PAR_FLAGS[@]}" \
     --sglang-attention-backend "$SGLANG_ATTN_BACKEND" \
     --sglang-mem-fraction-static "$MEM_FRAC" --sglang-context-length 8192 \
     --draft-config-path "$DRAFT_CONFIG" --block-size "$BLOCK_SIZE" \
