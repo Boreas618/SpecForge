@@ -101,6 +101,60 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
 
+    def _sample_anchor_positions(
+        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """DeepSpec-exact anchor sampling (``deepspec/modeling/dspark/common.py``
+        ``sample_anchor_positions``), overriding the inherited DFlash sampler.
+
+        Differences vs the DFlash sampler this replaces:
+          - candidates p in [0, seq_len-2] must satisfy loss_mask[p] AND
+            loss_mask[p+1] (DeepSpec's first-target-valid rule) — every kept
+            block has >= 1 supervised slot; the DFlash rule (loss_mask[p] only)
+            wastes anchors on zero-supervision blocks at turn boundaries;
+          - anchors within block_size of the sequence end are allowed (their
+            blocks truncate via the eval mask) instead of excluded;
+          - keep count per sample = min(valid_count, num_anchors) with no
+            off-by-one (the DFlash sampler capped at batch_max_valid - 1).
+
+        One disclosed deviation: DeepSpec always pads the anchor tensor to
+        num_anchors columns; we cap the width at the batch max keep count.
+        Dummy columns are fully masked either way (identical supervision and
+        loss); padding them out only burns draft-MLP compute on short samples.
+        """
+        bsz = loss_mask.shape[0]
+        num_candidates = max(seq_len - 1, 0)
+        if num_candidates == 0:
+            raise ValueError("seq_len < 2: no anchor candidates; preprocess the data.")
+        valid = (loss_mask[:, :num_candidates] > 0.5) & (
+            loss_mask[:, 1 : num_candidates + 1] > 0.5
+        )
+        valid_counts = valid.sum(dim=1)
+        max_n = int(min(self.num_anchors, int(valid_counts.max().item())))
+        if max_n <= 0:
+            raise ValueError(
+                "no valid anchors in batch (need loss_mask[p] & loss_mask[p+1]); "
+                "preprocess the data."
+            )
+        indices = (
+            torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
+        )
+        masked_indices = torch.where(
+            valid, indices, torch.full_like(indices, seq_len + 1)
+        )
+        random_vals = torch.rand(bsz, num_candidates, device=device)
+        random_vals = torch.where(
+            valid, random_vals, torch.full_like(random_vals, 2.0)
+        )
+        _, sorted_idx = random_vals.sort(dim=1)
+        gathered = torch.gather(masked_indices, 1, sorted_idx)
+        anchors = gathered[:, :max_n].sort(dim=1).values
+        keep_mask = torch.arange(max_n, device=device).unsqueeze(0) < (
+            valid_counts.unsqueeze(1).clamp(max=max_n)
+        )
+        anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
+        return anchors, keep_mask
+
     def _decay_weights(self, device: torch.device) -> torch.Tensor:
         """exp(-k/gamma) over within-block position k (DeepSpec convention).
 
@@ -503,9 +557,18 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 agree = ((pred == t_arg).float() * ev).sum()
                 ttop = (q.max(-1).values * ev).sum()
                 dtop = (p.max(-1).values * ev).sum()
+                # DeepSpec tau_probabilistic: expected accepted drafts per block
+                # (+1 bonus token), over blocks with >= 1 supervised slot.
+                vw = (ev.max(dim=-1).values > 0.5).float()  # [B, cb]
+                var = accept_rate.detach() * ev
+                tau_num = ((var.cumprod(dim=-1).sum(dim=-1) + 1.0) * vw).sum()
+                tau_den = vw.sum()
             else:
-                agree = ttop = dtop = zero
-        return ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp, agree, ttop, dtop
+                agree = ttop = dtop = tau_num = tau_den = zero
+        return (
+            ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp,
+            agree, ttop, dtop, tau_num, tau_den,
+        )
 
     def _chunked_numerators(
         self,
@@ -549,7 +612,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 out = self._chunk_terms(*chunk_args)
             acc = out if acc is None else tuple(a + o for a, o in zip(acc, out))
 
-        ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp, agree, ttop, dtop = acc
+        (
+            ce_num, l1_num, conf_num, correct_sum, ce_pp, acc_pp,
+            agree, ttop, dtop, tau_num, tau_den,
+        ) = acc
         probe_extras = {}
         if aligned_hidden_4d is not None:
             with torch.no_grad():
@@ -558,6 +624,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "agree_teacher": agree / _den,
                     "teacher_top1_prob": ttop / _den,
                     "draft_top1_prob": dtop / _den,
+                    "tau_probabilistic": tau_num / tau_den.clamp(min=1.0),
                 }
         count_per_position = eval_mask.sum(dim=(0, 1))
         return (
@@ -618,9 +685,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_probs = torch.softmax(logits_4d.float(), dim=-1)
             target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
             l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+            accept_rate = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             with torch.no_grad():
                 _den = eval_mask.sum().clamp(min=1.0)
                 _t_arg = aligned_target_logits.argmax(-1)
+                _vw = (eval_mask.max(dim=-1).values > 0.5).float()
+                _var = accept_rate.detach() * eval_mask
                 probe_extras = {
                     "agree_teacher": (
                         ((logits_4d.argmax(-1) == _t_arg).float() * eval_mask).sum()
@@ -632,10 +702,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "draft_top1_prob": (
                         (draft_probs.max(-1).values * eval_mask).sum() / _den
                     ),
+                    "tau_probabilistic": (
+                        ((_var.cumprod(dim=-1).sum(dim=-1) + 1.0) * _vw).sum()
+                        / _vw.sum().clamp(min=1.0)
+                    ),
                 }
             if self.l1_loss_alpha > 0:
                 l1_num = (l1_per_token * decay_weight_mask).sum()
-            accept_rate = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
 
         if (
             self.draft_model.confidence_head is not None
