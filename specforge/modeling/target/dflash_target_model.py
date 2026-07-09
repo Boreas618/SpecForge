@@ -178,9 +178,48 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
+        model = self.model_runner.model
+        # Prefer the DFlash capture hook: it applies a consistent +1 offset so the
+        # captured aux stream is the OUTPUT of each requested layer id (== the HF
+        # backend's hidden_states[idx+1] and the DSpark training semantics). The
+        # eagle3 hook only special-cases layer_ids[0]==1, so it would MIS-capture a
+        # spread that starts at a value != 1; the dflash hook is correct for any
+        # spread (e.g. GLM-5.2 aux [1, 19, 38, 57, 76] -> capture layers [2,20,39,58,77]
+        # = outputs of [1,19,38,57,76]). Fall back to eagle3 on older sglang.
+        if hasattr(model, "set_dflash_layers_to_capture"):
+            model.set_dflash_layers_to_capture(layer_ids)
+        elif hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(layer_ids)
+        inner = getattr(model, "model", None)
+        if inner is not None and hasattr(inner, "layers_to_capture"):
+            print(f"[capture] layers_to_capture={inner.layers_to_capture}")
+        # Ensure the target's FINAL post-norm hidden is surfaced for DSpark's L1 /
+        # confidence losses. sglang's deepseek_v2/GlmMoeDsa path CONCATENATES the k
+        # captured aux layers into output.hidden_states (width k*hidden) and does NOT
+        # separately return the final hidden. Wrap the inner model's forward to append
+        # the post-norm final hidden as the last aux entry, so the concat becomes
+        # (k+1)*hidden and _extend splits off last_hidden_states (the (k+1)*hidden
+        # branch). Idempotent; no-op if the forward already returns a non-tuple.
+        self._ensure_final_hidden_appended(inner)
+
+    def _ensure_final_hidden_appended(self, inner) -> None:
+        if inner is None or getattr(inner, "_dspark_final_appended", False):
+            return
+        orig_forward = inner.forward
+
+        def _forward_with_final(*args, **kwargs):
+            out = orig_forward(*args, **kwargs)
+            # Under aux capture the inner model returns (final_hidden, aux_list);
+            # append the post-norm final as the last aux entry. Leave the no-capture
+            # single-tensor return untouched.
+            if isinstance(out, tuple) and len(out) == 2:
+                hidden, aux = out
+                if isinstance(aux, list) and hidden is not None:
+                    return hidden, [*aux, hidden]
+            return out
+
+        inner.forward = _forward_with_final
+        inner._dspark_final_appended = True
 
     @torch.no_grad
     def _extend(self, reqs):
