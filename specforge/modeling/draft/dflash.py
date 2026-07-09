@@ -1,7 +1,10 @@
+import os
+from functools import partial
 from typing import Callable, Optional
 
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -18,6 +21,33 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 from typing_extensions import Tuple, Unpack
+
+# FlashAttention-4 flex backend, opt-in via env SPECFORGE_DRAFT_FLEX_BACKEND=fa4.
+# flex_attention with kernel_options={"BACKEND": "FLASH"} runs the FA4 kernel instead
+# of the Triton flex kernel (ref: meta-pytorch/attention-gym flex_flash_attention.py).
+#
+# STATUS on this stack (torch 2.11 / GB300 sm_10.3): the FA4 kernel works for a small
+# head_dim (64/128) BUT ONLY for a mask_mod that captures no tensors (it needs the
+# asymmetric block sparsity BLOCK_SIZE=(q=256, kv=128); see core/dflash.py). The DSpark
+# dual-source mask (`create_dflash_block_mask`) MUST capture per-sample `anchor_positions`
+# / `block_keep_mask` tensors, and the FA4 CuteDSL template fails on any captured-tensor
+# mask_mod ("CuteDSL template failed"), both dynamic=True and False. => FA4 is currently
+# NOT usable for the DSpark drafter; the default Triton flex backend (used when this env
+# is unset) handles the captured-tensor mask correctly and is the supported path.
+# (The DeepSeek-V4 DSpark draft was likewise FA4-ruled-out, there for head_dim 512.)
+# The code path is kept, gated + off by default, for a future stack / a captured-tensor-
+# free mask formulation. dynamic=True: draft Q/context lengths vary per batch.
+_FLEX_FA4_COMPILED = None
+
+
+def _flex_fa4():
+    global _FLEX_FA4_COMPILED
+    if _FLEX_FA4_COMPILED is None:
+        _FLEX_FA4_COMPILED = torch.compile(
+            partial(flex_attention, kernel_options={"BACKEND": "FLASH"}),
+            dynamic=True,
+        )
+    return _FLEX_FA4_COMPILED
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -115,20 +145,40 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
-        attn_fn: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attn_output, attn_weights = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+        # FA4 flex path (opt-in): call flex_attention with the FLASH kernel directly on
+        # the prebuilt dual-source BlockMask, bypassing HF's Triton-flex wrapper. q/k/v
+        # are already [B, H, S, D]; flex returns [B, H, S, D] -> transpose to [B, S, H, D]
+        # to match the reshape below. GQA (num_kv_heads < num_heads) via enable_gqa.
+        if (
+            self.config._attn_implementation in ("flex_attention", "flex")
+            and os.environ.get("SPECFORGE_DRAFT_FLEX_BACKEND") == "fa4"
+            and isinstance(attention_mask, BlockMask)
+        ):
+            attn_output = _flex_fa4()(
+                q,
+                k,
+                v,
+                block_mask=attention_mask,
+                scale=self.scaling,
+                enable_gqa=(self.num_key_value_groups > 1),
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_weights = None
+        else:
+            attn_fn: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attn_output, attn_weights = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights

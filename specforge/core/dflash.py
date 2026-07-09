@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash Training Wrapper."""
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -108,8 +109,23 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    # FA4 (FlashAttention-4) flex on SM100/Blackwell requires an asymmetric block
+    # sparsity of (q=256, kv=128); the default (128,128) raises
+    # "Block sparsity expects sparse_block_size_q=256". The Triton flex backend is
+    # fine with the default. Match the mask block size to the kernel when FA4 is on
+    # (env SPECFORGE_DRAFT_FLEX_BACKEND=fa4; consumed in modeling/draft/dflash.py).
+    extra = {}
+    if os.environ.get("SPECFORGE_DRAFT_FLEX_BACKEND") == "fa4":
+        extra["BLOCK_SIZE"] = (256, 128)
+
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+        **extra,
     )
 
 
