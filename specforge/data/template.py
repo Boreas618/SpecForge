@@ -291,6 +291,27 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# GLM-5.2 (glm_moe_dsa). NON-thinking training/eval: the tokenizer renders each
+# assistant turn as ``<|assistant|><think></think>{content}`` (empty think block,
+# since the regenerated data carries no reasoning_content). The assistant_header
+# therefore INCLUDES the empty ``<think></think>`` so the loss mask starts at the
+# generated content. Turns are delimited by the next role token, so ``<|user|>`` is
+# used as the end-of-turn delimiter (single-turn samples match to end-of-string) and
+# ignore_token zeroes the trailing ``<|user|>`` back out of the loss. parser_type
+# "glm" forces enable_thinking=False at render time (drops GLM's default
+# ``<|system|>Reasoning Effort`` turn). See GLMParser in parse.py.
+TEMPLATE_REGISTRY.register(
+    name="glm-5.2",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think></think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        ignore_token=["<|user|>"],
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="gemma",
     template=ChatTemplate(

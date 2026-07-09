@@ -47,7 +47,7 @@ except ImportError:
     process_vision_info = None
 
 
-from .parse import GeneralParser, HarmonyParser, ThinkingParser
+from .parse import GeneralParser, GLMParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -151,6 +151,8 @@ def preprocess_conversations(
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "glm":
+        parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
