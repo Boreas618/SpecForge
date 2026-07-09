@@ -760,7 +760,8 @@ def main():
     # attention compile, while the objective's data-dependent ops — all_reduce,
     # .item(), the vocab-softmax — graph-break cleanly). dynamic=True: draft
     # Q/context lengths vary per batch (data-dependent num_anchors). Enabled by
-    # SPECFORGE_COMPILE_DRAFT (the GLM run script sets it =1); set =0 to disable.
+    # SPECFORGE_COMPILE_DRAFT (default OFF, incl. the GLM run script); set =1 to
+    # enable only after the FSDP-recompile crash is fixed.
     if os.environ.get("SPECFORGE_COMPILE_DRAFT", "0") == "1":
         dspark_model = torch.compile(dspark_model, dynamic=True)
         print_with_rank("Applied torch.compile to dspark_model (SPECFORGE_COMPILE_DRAFT=1)")
