@@ -274,7 +274,7 @@ streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_S
     --ce-loss-alpha 0.1 --l1-loss-alpha 0.9 --confidence-head-alpha 1.0 \
     --log-interval "$LOG_INTERVAL" --save-interval "$SAVE_INTERVAL" \
     --evals-per-epoch "${EVALS_PER_EPOCH:-10}" \
-    --dataloader-num-workers 4 --build-dataset-num-proc "$SPECFORGE_DATA_NUM_PROC" \
+    --dataloader-num-workers 0 --build-dataset-num-proc "$SPECFORGE_DATA_NUM_PROC" \
     --dist-timeout 60 "${tracker[@]}" "${EXTRA[@]}"
 }
 
