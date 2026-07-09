@@ -100,6 +100,9 @@ class SGLangBackendArgs:
     sglang_piecewise_cuda_graph_max_tokens: int = 4096
     sglang_piecewise_cuda_graph_tokens: List[int] = None
     sglang_ep_size: int = 1
+    sglang_dp_size: int = 1
+    sglang_moe_a2a_backend: str = "none"
+    sglang_moe_runner_backend: str = "auto"
     sglang_max_running_requests: int = None  # assign based on batch size
     sglang_max_total_tokens: int = None  # assign based on batch size and seq length
 
@@ -174,6 +177,28 @@ class SGLangBackendArgs:
             default=1,
             help="The ep size of the SGLang backend",
         )
+        parser.add_argument(
+            "--sglang-dp-size",
+            type=int,
+            default=1,
+            help="The data-parallel size of the SGLang backend. With "
+            "--sglang-enable-dp-attention set this to the world/tp size to make "
+            "attention data-parallel (attn_tp = tp_size // dp_size).",
+        )
+        parser.add_argument(
+            "--sglang-moe-a2a-backend",
+            type=str,
+            default="none",
+            help="SGLang MoE all-to-all backend (e.g. 'deepep' for DP-attention + "
+            "expert-parallel MoE, or 'none'). Validated by sglang ServerArgs.",
+        )
+        parser.add_argument(
+            "--sglang-moe-runner-backend",
+            type=str,
+            default="auto",
+            help="SGLang MoE runner backend (default 'auto' lets sglang resolve it, "
+            "e.g. flashinfer_trtllm for fp4/fp8 DeepSeek-V4). Validated by ServerArgs.",
+        )
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "SGLangBackendArgs":
@@ -190,6 +215,9 @@ class SGLangBackendArgs:
             sglang_piecewise_cuda_graph_max_tokens=args.sglang_piecewise_cuda_graph_max_tokens,
             sglang_piecewise_cuda_graph_tokens=args.sglang_piecewise_cuda_graph_tokens,
             sglang_ep_size=args.sglang_ep_size,
+            sglang_dp_size=args.sglang_dp_size,
+            sglang_moe_a2a_backend=args.sglang_moe_a2a_backend,
+            sglang_moe_runner_backend=args.sglang_moe_runner_backend,
             sglang_max_running_requests=(
                 args.target_batch_size if hasattr(args, "target_batch_size") else None
             ),
@@ -214,6 +242,9 @@ class SGLangBackendArgs:
             piecewise_cuda_graph_max_tokens=self.sglang_piecewise_cuda_graph_max_tokens,
             piecewise_cuda_graph_tokens=self.sglang_piecewise_cuda_graph_tokens,
             ep_size=self.sglang_ep_size,
+            dp_size=self.sglang_dp_size,
+            moe_a2a_backend=self.sglang_moe_a2a_backend,
+            moe_runner_backend=self.sglang_moe_runner_backend,
             max_running_requests=self.sglang_max_running_requests,
             max_total_tokens=self.sglang_max_total_tokens,
         )

@@ -4,6 +4,10 @@
 released `deepseek-ai/DeepSeek-V4-Flash-DSpark`, on this box, using SpecForge's online trainer.
 Started 2026-07-06. Owner: yi.sun@radixark.ai.
 
+> **This doc records the single-node (4× GB300, tp=4/dp=1) run.** The two-node
+> scale-out plan lives in **`EXECUTION_DOC_2NODE.md`** (genuine DP-attention data
+> parallelism, following the `origin/reproduction` DFlash two-node practice).
+
 ---
 
 ## 0. Environment (verified)

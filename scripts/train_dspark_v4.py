@@ -255,12 +255,25 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"Filtered train dataset: {original_size} -> {len(train_ds)} samples"
     )
 
+    # Under sglang DP-attention the target runs data-parallel across ALL ranks
+    # (each rank forwards a distinct shard), so the draft must see a distinct shard
+    # per rank too -> shard over the whole world (process_group=None -> a world-wide
+    # DistributedSampler). Without DP-attention the target is TP-replicated and ranks
+    # in a TP group must consume identical data, so we shard over the DP group only.
+    # Effective global batch is WORLD*batch_size (DP-attn) vs dp_size*batch_size.
+    # (Matches origin/reproduction's DFlash trainer; the DSpark pooled-global-mean
+    # objective in core/dspark.py is already correct for this genuine-DP case.)
+    use_dp_attention = (
+        args.target_model_backend == "sglang" and args.sglang_enable_dp_attention
+    )
+    data_parallel_group = None if use_dp_attention else get_dp_group()
+
     train_dataloader = prepare_dp_dataloaders(
         train_ds,
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=data_parallel_group,
     )
 
     eval_dataloader = None
@@ -278,7 +291,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=data_parallel_group,
         )
     return train_dataloader, eval_dataloader
 
@@ -427,7 +440,7 @@ def main():
         target_embed_tokens=target_components.embed_tokens,
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
-        attention_backend="eager",
+        attention_backend="flex_attention",
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
         ce_loss_alpha=args.ce_loss_alpha,
