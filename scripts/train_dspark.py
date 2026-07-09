@@ -26,7 +26,36 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from accelerate.utils import set_seed
+
+# Per-rank compile caches + generous PG timeouts: a tp=16 sglang target load (~753B
+# GLM-5.2-FP8) and the first flex/torch.compile autotune can exceed torch's 10-min
+# default collective timeout on multi-node. Ported from train_dspark_v4.py.
+_lr = os.environ.get("LOCAL_RANK", "0")
+_cb = os.environ.get("SPECFORGE_RANK_CACHE_BASE", "/tmp/sf_caches")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{_cb}/inductor_rank{_lr}")
+os.environ.setdefault("TRITON_CACHE_DIR", f"{_cb}/triton_rank{_lr}")
+from datetime import timedelta as _td  # noqa: E402
+from torch.distributed import distributed_c10d as _c10d  # noqa: E402
+
+_ong, _oip = _c10d.new_group, _c10d.init_process_group
+
+
+def _ng(*a, **k):
+    k["timeout"] = _td(minutes=45)
+    return _ong(*a, **k)
+
+
+def _ip(*a, **k):
+    k["timeout"] = _td(minutes=45)
+    return _oip(*a, **k)
+
+
+_c10d.new_group = _ng
+_c10d.init_process_group = _ip
+dist.new_group = _ng
+dist.init_process_group = _ip
+
+from accelerate.utils import set_seed  # noqa: E402
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
@@ -164,6 +193,26 @@ def parse_args():
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--eval-datasets-dir",
+        type=str,
+        default=None,
+        help="Directory of DeepSpec accept-length benchmark jsonl files. If set, "
+        "runs the DeepSpec-style mean-accepted-length eval (greedy) every "
+        "--eval-interval steps, reusing the loaded sglang target. Off if unset.",
+    )
+    dataset_group.add_argument(
+        "--eval-limit-per-task",
+        type=int,
+        default=32,
+        help="Max prompts per benchmark for the in-loop accept-length eval.",
+    )
+    dataset_group.add_argument(
+        "--eval-max-new-tokens",
+        type=int,
+        default=256,
+        help="Max new tokens per prompt for the in-loop accept-length eval.",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
@@ -332,12 +381,24 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
     )
 
+    # Under sglang DP-attention the target runs data-parallel across ALL ranks (each
+    # rank forwards a distinct shard), so the draft must see a distinct shard per rank
+    # too -> shard over the whole world (process_group=None -> world-wide sampler).
+    # Without DP-attention the target is TP-replicated and ranks in a TP group must
+    # consume identical data, so we shard over the DP group only. The DSpark
+    # pooled-global-mean objective (core/dspark.py) is correct for both. Mirrors
+    # train_dspark_v4.py.
+    use_dp_attention = (
+        args.target_model_backend == "sglang" and args.sglang_enable_dp_attention
+    )
+    data_parallel_group = None if use_dp_attention else get_dp_group()
+
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
-        process_group=get_dp_group(),
+        process_group=data_parallel_group,
     )
 
     eval_dataloader = None
@@ -355,7 +416,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
-            process_group=get_dp_group(),
+            process_group=data_parallel_group,
         )
 
     return train_dataloader, eval_dataloader
@@ -434,6 +495,64 @@ def record_metrics(
     )
 
     tracker.log(logdict, step=global_step)
+
+
+def _maybe_run_accept_length_eval(
+    args, dspark_model, draft_model, target_model, target_components, tokenizer,
+    tracker, global_step,
+):
+    """Best-effort in-loop DeepSpec accept-length eval (greedy), reusing the loaded
+    sglang target. Guarded: only runs when --eval-datasets-dir is set, and any
+    failure is swallowed so it can never kill a long training run. The standalone
+    scripts/eval_dspark_deepspec.py is the primary/validated eval path."""
+    if not args.eval_datasets_dir:
+        return
+    import importlib.util
+
+    try:
+        spec_path = os.path.join(os.path.dirname(__file__), "eval_dspark_deepspec.py")
+        spec = importlib.util.spec_from_file_location("eval_dspark_deepspec", spec_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        device = next(draft_model.parameters()).device
+        with FSDP.summon_full_params(dspark_model, recurse=True, writeback=False):
+            draft_model.eval()
+            result = mod.run_deepspec_eval(
+                target_model=target_model,
+                draft_model=draft_model,
+                target_lm_head=target_components.lm_head,
+                target_embed_tokens=target_components.embed_tokens,
+                tokenizer=tokenizer,
+                tasks=None,
+                eval_datasets_dir=args.eval_datasets_dir,
+                limit_per_task=args.eval_limit_per_task,
+                max_new_tokens=args.eval_max_new_tokens,
+                temperature=0.0,
+                device=device,
+                verbose=(dist.get_rank() == 0),
+            )
+        draft_model.train()
+        if dist.get_rank() == 0 and result:
+            overall = result.get("overall", {})
+            logd = {}
+            mal = overall.get("mean_accepted_length")
+            if mal is not None:
+                logd["eval/mean_accepted_length"] = mal
+            for task, m in result.get("per_dataset", {}).items():
+                v = m.get("mean_accepted_length")
+                if v is not None:
+                    logd[f"eval/{task}/accept_len"] = v
+            if logd:
+                tracker.log(logd, step=global_step)
+            print_on_rank0(f"[accept-length eval @ step {global_step}] {overall}")
+    except Exception as e:  # noqa: BLE001
+        print_on_rank0(
+            f"[accept-length eval] skipped (error: {type(e).__name__}: {e})"
+        )
+        try:
+            draft_model.train()
+        except Exception:
+            pass
 
 
 def main():
@@ -545,6 +664,15 @@ def main():
     )
 
     # Wrap each transformer block as its own FSDP unit (compute/comm overlap).
+    # Sharding strategy (env SPECFORGE_FSDP_STRATEGY): the ~3.8B dense draft is small,
+    # so shard_grad_op (default) keeps params resident (no fwd/bwd all-gather) while
+    # sharding grads+optimizer -> fast and fits easily beside the 47GB/rank FP8 target.
+    # full_shard / no_shard available for larger drafts or debugging.
+    _strat = {
+        "full_shard": ShardingStrategy.FULL_SHARD,
+        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+        "no_shard": ShardingStrategy.NO_SHARD,
+    }[os.environ.get("SPECFORGE_FSDP_STRATEGY", "shard_grad_op")]
     fsdp_kwargs = dict(
         use_orig_params=True,
         forward_prefetch=True,
@@ -554,7 +682,7 @@ def main():
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=_strat,
     )
     block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
     block_classes = {
@@ -582,16 +710,30 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
+        offload_master=os.environ.get("SPECFORGE_OFFLOAD_MASTER", "0") == "1",
     )
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state)
+        if os.environ.get("SPECFORGE_RESUME_FULL_OPTIM") == "1":
+            # Full resume incl. AdamW moments. Only correct if the checkpoint's
+            # flat-param sharding matches this run's exactly; under FSDP the raw
+            # per-shard AdamW state saved by BF16Optimizer does NOT reshard onto a
+            # fresh wrap -> exp_avg vs grad size mismatch at optimizer.step().
+            optimizer.load_state_dict(resume_state)
+            print_on_rank0("Restored FULL optimizer + scheduler state")
+        else:
+            # Reshard-safe resume (default): restore the LR scheduler + step exactly,
+            # but reset the Adam moments (they re-warm in ~tens of steps). Avoids the
+            # FSDP flat-param reshard mismatch that crashes optimizer.step().
+            optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            print_on_rank0(
+                "Restored LR scheduler + step; Adam moments reset (reshard-safe)"
+            )
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
         print_on_rank0(
-            f"Restored optimizer/scheduler state: "
-            f"epoch={start_epoch}, step={global_step}, "
+            f"Resumed training state: epoch={start_epoch}, step={global_step}, "
             f"lr={optimizer.get_learning_rate():.6f}"
         )
 
@@ -701,6 +843,12 @@ def main():
             if global_step % args.save_interval == 0:
                 save_checkpoint(
                     args, epoch, global_step, dspark_model, draft_model, optimizer
+                )
+
+            if args.eval_datasets_dir and global_step % args.eval_interval == 0:
+                _maybe_run_accept_length_eval(
+                    args, dspark_model, draft_model, target_model,
+                    target_components, tokenizer, tracker, global_step,
                 )
 
             if args.max_steps is not None and global_step >= args.max_steps:
