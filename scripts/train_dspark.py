@@ -941,6 +941,15 @@ def main():
             (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
+                # DeepSpec parity (base_trainer.py): clip by the GLOBAL grad norm
+                # before the optimizer step. FSDP.clip_grad_norm_ all-reduces the
+                # norm across shards -> one uniform scale on every rank. The
+                # BF16Optimizer's internal local-shard clip then no-ops (each
+                # post-clip local norm <= global norm <= max_norm), whereas on
+                # its own it clips each shard by its LOCAL norm — a ~sqrt(world)x
+                # looser, non-uniform threshold under sharding.
+                if hasattr(dspark_model, "clip_grad_norm_"):
+                    dspark_model.clip_grad_norm_(args.max_grad_norm)
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
