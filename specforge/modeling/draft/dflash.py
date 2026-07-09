@@ -113,6 +113,14 @@ class Qwen3DFlashAttention(nn.Module):
             else None
         )
 
+    # Keep the dual-source attention OUT of any outer torch.compile region: the
+    # flex_attention block-mask HOP fails inductor lowering when nested inside a
+    # larger dynamic-shape graph on this stack (CantSplit / "unsupported operand &"),
+    # even though it compiles fine on its own (HF's flex integration compiles it
+    # separately). Marking the attention compiler-disabled lets SPECFORGE_COMPILE_DRAFT
+    # fuse the rest of the block (RoPE, RMSNorm, MLP, residual) while the flex
+    # attention keeps its own (block-sparse, separately-compiled) fast path.
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
