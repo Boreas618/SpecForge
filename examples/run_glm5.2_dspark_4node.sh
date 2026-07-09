@@ -184,9 +184,12 @@ cmd_train() {
   # Small dense draft: params resident (shard_grad_op), no CPU master offload.
   export SPECFORGE_FSDP_STRATEGY=${SPECFORGE_FSDP_STRATEGY:-shard_grad_op}
   export SPECFORGE_OFFLOAD_MASTER=${SPECFORGE_OFFLOAD_MASTER:-0}
-  # torch.compile the draft (validated: FSDP+flex+objective+bwd; ~55s first-step
-  # compile then ~0.1s/step, dynamic shapes handled). ON by default; set =0 to disable.
-  export SPECFORGE_COMPILE_DRAFT=${SPECFORGE_COMPILE_DRAFT:-1}
+  # torch.compile the draft: OFF by default. It CRASHES with FSDP under real
+  # varying-length data — dynamo recompiles on a new shape after grads exist and
+  # hits "assign a gradient of size [s0] to a tensor of size [s19]" (FSDP sharded
+  # grad vs full param) in Qwen3RMSNorm. Eager is validated + stable; the run is
+  # target-bound so compile is marginal. Set =1 only after the FSDP-recompile fix.
+  export SPECFORGE_COMPILE_DRAFT=${SPECFORGE_COMPILE_DRAFT:-0}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
   # Draft attention: Triton flex (handles the data-dependent dual-source BlockMask).
