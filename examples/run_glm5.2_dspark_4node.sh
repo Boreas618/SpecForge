@@ -52,7 +52,8 @@ LEARNING_RATE=${LEARNING_RATE:-6e-4}
 WARMUP_RATIO=${WARMUP_RATIO:-0.04}
 MAX_LEN=${MAX_LEN:-4096}
 BLOCK_SIZE=${BLOCK_SIZE:-7}                # config-owned; passed for the loss-token filter
-NUM_ANCHORS=${NUM_ANCHORS:-512}
+NUM_ANCHORS=${NUM_ANCHORS:-1024}         # RedHat's max_anchors (owner: follow RedHat). Watch the
+                                         # [B,1024,7,154880] objective tensor for OOM; drop if it bites.
 MEM_FRAC=${MEM_FRAC:-0.6}                  # target ~47GB/rank at tp16 -> ample room
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
@@ -72,8 +73,9 @@ EVAL_DATA=${EVAL_DATA:-$DATA_DIR/glm52_dspark_eval.jsonl}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/outputs/glm5.2-dspark-4node}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-glm-5.2}
 TOTAL_SAMPLES=${TOTAL_SAMPLES:-1500000}
-# Optional: DeepSpec accept-length benchmark jsonl dir -> in-loop greedy eval.
-EVAL_DATASETS_DIR=${EVAL_DATASETS_DIR:-}
+# DeepSpec accept-length benchmark jsonl dir -> in-loop gsm8k accept-length eval
+# (built by `prepare`). Set empty to disable the periodic eval.
+EVAL_DATASETS_DIR=${EVAL_DATASETS_DIR:-$HF_HOME/glm52_evalds}
 
 # ---- tracking -------------------------------------------------------------
 REPORT_TO=${REPORT_TO:-wandb}
@@ -113,6 +115,22 @@ PY
     log "prepare[2/3]: building mixed GLM-5.2 corpus (mgoin + codealpaca -> ${TOTAL_SAMPLES})"
     python3 "$ROOT_DIR/scripts/prepare_glm52_dspark_data.py" \
       --output-dir "$DATA_DIR" --total-samples "$TOTAL_SAMPLES" --eval-size "${EVAL_SIZE:-2000}"
+  fi
+  # gsm8k accept-length benchmark (DeepSpec-exact: openai/gsm8k main/test, each
+  # question + the DeepSpec reasoning suffix). Small; built per node (node-local FS).
+  if [ -n "$EVAL_DATASETS_DIR" ] && [ ! -f "$EVAL_DATASETS_DIR/gsm8k.jsonl" ]; then
+    log "prepare[2b/3]: building DeepSpec gsm8k.jsonl -> $EVAL_DATASETS_DIR"
+    mkdir -p "$EVAL_DATASETS_DIR"
+    python3 - "$EVAL_DATASETS_DIR/gsm8k.jsonl" <<'PY'
+import sys, json
+from datasets import load_dataset
+SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
+ds = load_dataset("openai/gsm8k", "main", split="test")
+with open(sys.argv[1], "w") as f:
+    for row in ds:
+        f.write(json.dumps({"turns": [f"{row['question']}{SUFFIX}"]}) + "\n")
+print("  gsm8k rows:", sum(1 for _ in open(sys.argv[1])))
+PY
   fi
   log "prepare[3/3]: warming tokenized cache"
   python3 - "$TRAIN_DATA" "$MAX_LEN" "$CHAT_TEMPLATE" "$TARGET_MODEL" "$ROOT_DIR/cache" <<'PY'
@@ -158,6 +176,9 @@ cmd_train() {
   # Small dense draft: params resident (shard_grad_op), no CPU master offload.
   export SPECFORGE_FSDP_STRATEGY=${SPECFORGE_FSDP_STRATEGY:-shard_grad_op}
   export SPECFORGE_OFFLOAD_MASTER=${SPECFORGE_OFFLOAD_MASTER:-0}
+  # torch.compile the draft (validated: FSDP+flex+objective+bwd; ~55s first-step
+  # compile then ~0.1s/step, dynamic shapes handled). ON by default; set =0 to disable.
+  export SPECFORGE_COMPILE_DRAFT=${SPECFORGE_COMPILE_DRAFT:-1}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
   # Draft attention: Triton flex (handles the data-dependent dual-source BlockMask).
@@ -218,7 +239,8 @@ attn=$SGLANG_ATTN_BACKEND iface=$NCCL_SOCKET_IFNAME"
     --max-length "$MAX_LEN" --chat-template "$CHAT_TEMPLATE" \
     --num-anchors "$NUM_ANCHORS" --loss-decay-gamma 4.0 \
     --ce-loss-alpha 0.1 --l1-loss-alpha 0.9 --confidence-head-alpha 1.0 \
-    --log-interval "$LOG_INTERVAL" --save-interval "$SAVE_INTERVAL" --eval-interval "${EVAL_INTERVAL:-500}" \
+    --log-interval "$LOG_INTERVAL" --save-interval "$SAVE_INTERVAL" \
+    --evals-per-epoch "${EVALS_PER_EPOCH:-10}" \
     --dataloader-num-workers 4 --build-dataset-num-proc "$SPECFORGE_DATA_NUM_PROC" \
     --dist-timeout 60 "${tracker[@]}" "${EXTRA[@]}"
 }
