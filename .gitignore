@@ -172,6 +172,10 @@ cython_debug/
 # Learn more at https://abstra.io/docs
 .abstra/
 
+# Local launch cheatsheets / secrets — NEVER commit (contain API tokens)
+*.local.sh
+GLM52_LAUNCH.local.sh
+
 # Visual Studio Code
 #  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore

@@ -9,35 +9,49 @@ ran the propose -> verify -> accept loop).
 
 What it measures
 ----------------
-For each eval prompt it runs greedy speculative decoding with the trained DSpark
+For each eval prompt it runs speculative decoding with the trained DSpark
 drafter against the *real* target model and reports, per dataset:
 
-  * ``mean_accepted_length`` = sum(accepted_draft_tokens + 1) / num_proposals
-    (the DeepSpec ``acceptance_length`` metric; the ``+1`` is the bonus token the
-    target always contributes each verify step).
-  * ``accept_rate@k``       = fraction of proposals whose k-th drafted token was
-    accepted (position 0 .. block_size-1).
-  * ``verify_rate``         = accepted / (proposed + proposals).
+  * ``mean_accepted_length`` = acceptance_length_sum / num_proposals (the DeepSpec
+    ``acceptance_length`` metric; each verify step contributes accepted + 1 for
+    the target's bonus token, or just accepted when a stop token terminates the
+    step inside the accepted drafts).
+  * ``accept_rate@k``       = accepted_at_pos[k] / proposals_at_pos[k], where a
+    proposal counts at k iff its effective proposal length > k and is accepted at
+    k iff its accepted-draft length > k (position 0 .. block_size-1).
+  * ``verify_rate``         = acceptance_length_sum / (proposal_length_sum +
+    num_proposals).
 
 plus a pooled ``overall`` mean over all datasets.
 
-Algorithm (DeepSpec, greedy / temperature=0 default)
-----------------------------------------------------
+Algorithm (DeepSpec, faithful rejection-sampling verify)
+--------------------------------------------------------
+This is a 100% faithful mirror of DeepSpec's ``generate_decoding_sample`` +
+``verify_draft_tokens`` (deepspec/eval/base_evaluator.py) and its sampling math
+(deepspec/utils/sampling.py). DeepSpec's rejection-sampling accept test reduces
+to greedy argmax-match at temperature 0, so the result is bit-exact vs
+DeepSpec-greedy at ``--temperature 0`` and remains faithful at any temperature.
+
 1. Prefill the prompt through the target -> aux context hidden states (for the
-   draft) + the target's final hidden state (-> target lm_head -> first token).
+   draft) + the target's final hidden state (-> target lm_head -> first token via
+   ``sample_from_probs(logits_to_probs(...))``).
 2. Repeat:
    (a) PROPOSE: the draft proposes ``block_size`` tokens. Slot 0 embeds the last
        accepted token, slots 1..block_size-1 embed ``mask_token_id``. Run the
        draft backbone once (conditioned on the target aux context), then apply
        the Markov head *autoregressively* within the block: each slot's logits
-       get the low-rank bigram bias from the previously drafted token.
+       get the low-rank bigram bias from the previously drafted token. Returns
+       the ``block_size`` drafted tokens AND the per-position draft distribution
+       ``draft_probs`` used to propose them.
    (b) VERIFY: run the target over ``[accepted_token, draft_0 .. draft_{B-1}]``
-       and read its per-position argmax (via last_hidden_states -> target
-       lm_head).
-   (c) ACCEPT (greedy): accepted_length = # leading drafted tokens whose id
-       matches the target argmax at the same position (cumprod), then commit
-       those + 1 bonus token from the target, advance, and reuse the verify
-       prefill's hidden states as the next block's draft context.
+       and read its per-position distribution ``target_probs =
+       logits_to_probs(target_lm_head(last_hidden_states))``.
+   (c) ACCEPT (rejection sampling): accept_prob[j] = min(1, target_probs[j,tok] /
+       draft_probs[j,tok]); accept a leading prefix via ``rand < accept_prob``
+       (cumprod). The next token is a residual sample on the first rejected
+       position, or the target's bonus token on full accept. Truncate on a stop
+       token, advance, and reuse the verify prefill's hidden states as the next
+       block's draft context.
 
 Why re-prefill?  (cost / correctness trade-off)
 -----------------------------------------------
@@ -47,16 +61,14 @@ That backend only exposes a *prefill* path (``generate_dflash_data`` /
 ``_extend``) -- there is **no** KV-cache incremental-decode API. So each verify
 step RE-PREFILLS the whole growing sequence and reads ``last_hidden_states`` (->
 target lm_head -> logits) at the block positions, plus the aux context for the
-next draft block. This is O(n^2) in sequence length but exactly correct. Keep
-``--max-new-tokens`` (default 512; DeepSpec uses 2048) and ``--limit-per-task``
-(default 64) small so a full sweep stays tractable.
+next draft block. Under greedy this is numerically identical to DeepSpec's
+KV-cache verify path (same prefix -> same per-position logits); it is O(n^2) in
+sequence length but exactly correct. The standalone CLI defaults to DeepSpec's
+gsm8k protocol (``--max-new-tokens 2048``, ``--limit-per-task 500``); shrink both
+for a quick sweep or for the in-training periodic eval.
 
 TODO: a faster path would keep the target KV cache across spec steps (needs an
 incremental-decode entry point on the sglang backend) instead of re-prefilling.
-
-TODO: stochastic (temperature>0) rejection sampling. Only greedy argmax-match
-acceptance is implemented; ``--temperature`` only affects draft *proposal*
-sampling and the acceptance test degrades to an approximation for temp>0.
 
 Datasets
 --------
@@ -129,15 +141,59 @@ DEFAULT_TASKS: Tuple[Tuple[str, int], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Sampling helpers
+# Sampling helpers -- verbatim ports of DeepSpec's deepspec/utils/sampling.py
+# (+ seed_all) so the propose/verify/accept math is a bit-exact mirror. At
+# temperature 0 every one of these reduces to the deterministic argmax path.
 # ---------------------------------------------------------------------------
-def _sample_tokens(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Greedy argmax for temperature<=0, else multinomial. Returns [B, S]."""
+def logits_to_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """DeepSpec ``logits_to_probs``: one-hot argmax at temp<1e-5, else softmax."""
+    if temperature < 1e-5:
+        probs = torch.zeros_like(logits, dtype=torch.float32)
+        probs.scatter_(-1, torch.argmax(logits, dim=-1, keepdim=True), 1.0)
+        return probs
+    return torch.softmax(logits.float() / temperature, dim=-1)
+
+
+def sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    """DeepSpec ``sample_from_probs``: multinomial over probs [B, S, V] -> [B, S]."""
+    bsz, seq_len, vocab_size = probs.shape
+    flat = probs.reshape(-1, vocab_size)
+    return torch.multinomial(flat, num_samples=1).reshape(bsz, seq_len)
+
+
+def sample_tokens(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    """DeepSpec ``sample_tokens``: argmax at temp<1e-5, else multinomial. -> [B, S]."""
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
     bsz, seq_len, vocab_size = logits.shape
-    probs = torch.softmax(logits.reshape(-1, vocab_size).float() / temperature, dim=-1)
+    flat_logits = logits.reshape(-1, vocab_size) / temperature
+    probs = torch.softmax(flat_logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).reshape(bsz, seq_len)
+
+
+def gather_token_probs(probs: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """DeepSpec ``gather_token_probs``: probs[..., V], ids[...] -> [...]."""
+    return probs.gather(dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
+
+
+def sample_residual(
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+) -> torch.Tensor:
+    """DeepSpec ``sample_residual``: sample the clamped (target-draft) residual. -> [B]."""
+    residual = torch.clamp(target_probs - draft_probs, min=0.0)
+    residual_mass = residual.sum(dim=-1, keepdim=True)
+    if torch.any(residual_mass <= 1e-8):
+        residual = torch.where(residual_mass <= 1e-8, target_probs, residual)
+        residual_mass = residual.sum(dim=-1, keepdim=True)
+    residual = residual / residual_mass.clamp_min(1e-8)
+    return sample_from_probs(residual.unsqueeze(1)).squeeze(1)
+
+
+def seed_all(seed: int) -> None:
+    """DeepSpec ``seed_all``: seed the CPU + all-CUDA torch RNGs (per-sample)."""
+    torch.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
 
 
 def _draft_block_tokens(
@@ -146,32 +202,41 @@ def _draft_block_tokens(
     *,
     seed_token: torch.Tensor,
     temperature: float,
-) -> torch.Tensor:
-    """Autoregressive within-block sampling with the DSpark Markov head.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Autoregressive within-block draft sampling (DeepSpec ``sample_block_tokens``).
 
-    ``base_logits`` [1, block_size, vocab] are the frozen target-lm_head logits
-    on the (mask-noise) draft backbone hidden states -- computed once, in
-    parallel, for the whole block. The Markov head then adds, per slot, the
-    low-rank bigram bias conditioned on the *previously drafted* token (slot 0's
-    prev token is the accepted seed token). This mirrors
-    ``VanillaMarkov.sample_block_tokens`` in DeepSpec, but uses SpecForge's
-    ``VanillaMarkov.compute_step_bias(token_ids)`` head (no hidden_states arg).
+    ``base_logits`` [1, block_size, vocab] are ``target_lm_head`` applied to the
+    (mask-noise) draft backbone hidden states -- computed once, in parallel, for
+    the whole block. The Markov head then adds, per slot j, the low-rank bigram
+    bias conditioned on the *previously drafted* token (slot 0's prev token is
+    the accepted ``seed_token``); slot j is sampled from the corrected logits and
+    then feeds slot j+1's bias. Mirrors ``VanillaMarkov.sample_block_tokens`` in
+    DeepSpec, using SpecForge's ``VanillaMarkov.compute_step_bias(token_ids)``
+    (no hidden_states arg -- identical for the vanilla head).
+
+    Returns ``(tokens [1, block_size], corrected_logits [1, block_size, vocab])``;
+    the caller forms ``draft_probs = logits_to_probs(corrected_logits, temp)`` so
+    the drafted token is exactly a sample from that distribution.
     """
     block_size = base_logits.shape[1]
     markov = getattr(draft_model, "markov_head", None)
     if markov is None:
-        return _sample_tokens(base_logits, temperature)
+        # No bigram correction: slots are independent, so sample in parallel and
+        # the corrected logits are just the base logits.
+        return sample_tokens(base_logits, temperature), base_logits
 
     sampled: List[torch.Tensor] = []
+    corrected: List[torch.Tensor] = []
     prev_token = seed_token.long()  # [1]
     for step_idx in range(block_size):
         step_logits = base_logits[:, step_idx, :]  # [1, vocab]
         bias = markov.compute_step_bias(prev_token)  # [1, vocab]
         step_logits = step_logits + bias.to(step_logits.dtype)
-        next_token = _sample_tokens(step_logits.unsqueeze(1), temperature).squeeze(1)
+        corrected.append(step_logits.unsqueeze(1))
+        next_token = sample_tokens(step_logits.unsqueeze(1), temperature).squeeze(1)
         sampled.append(next_token)
         prev_token = next_token
-    return torch.stack(sampled, dim=1)  # [1, block_size]
+    return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
 
 
 def _contains_stop(
@@ -241,7 +306,7 @@ def _encode_prompt(
     """Format one user turn with the chat template (enable_thinking=False)."""
     messages = [{"role": "user", "content": turn}]
     try:
-        input_ids = tokenizer.apply_chat_template(
+        enc = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -249,11 +314,16 @@ def _encode_prompt(
         )
     except TypeError:
         # Older/other tokenizers may not accept enable_thinking.
-        input_ids = tokenizer.apply_chat_template(
+        enc = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             return_tensors="pt",
         )
+    # apply_chat_template may return a bare tensor OR a BatchEncoding/dict
+    # (GLM-5.2's tokenizer returns the latter); normalize to a [1, S] tensor.
+    input_ids = enc["input_ids"] if hasattr(enc, "keys") else enc
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
     if input_ids.shape[1] > max_prompt_len:
         return None
     return input_ids.to(device)
@@ -278,10 +348,19 @@ def _spec_decode_sample(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Dict[str, object]:
-    """Greedy speculative decoding for one prompt via re-prefill verification.
+    """DeepSpec speculative decoding for one prompt via re-prefill verification.
 
-    Returns per-proposal ``acceptance_lengths`` (accepted+1) and
-    ``accepted_draft_lengths`` (accepted), plus token counts.
+    A faithful mirror of DeepSpec's ``generate_decoding_sample`` +
+    ``verify_draft_tokens`` (rejection-sampling accept), which reduces to greedy
+    argmax-match at temperature 0. Returns, per proposal:
+
+      * ``acceptance_lengths``     -- accepted + bonus (or ``accepted`` when the
+        step is terminated by a stop token inside the accepted drafts),
+      * ``proposal_lengths``       -- the effective proposal length (``block_size``
+        or ``eos_pos + 1`` on EOS-terminate),
+      * ``accepted_draft_lengths`` -- the number of accepted drafted tokens,
+
+    plus token counts.
     """
     num_input = input_ids.shape[1]
     max_length = num_input + max_new_tokens
@@ -299,26 +378,30 @@ def _spec_decode_sample(
     context = out.hidden_states.to(device=device, dtype=dtype)  # [1, num_input, k*h]
     last_hidden = out.last_hidden_states.to(device=device, dtype=dtype)
 
-    # First token = target argmax at the last prompt position.
+    # First token = sample_from_probs(logits_to_probs(target_logits)) at last pos.
     first_logits = target_lm_head(last_hidden[:, -1:, :])  # [1, 1, vocab]
-    first_token = _sample_tokens(first_logits, temperature)  # [1, 1]
+    first_token = sample_from_probs(
+        logits_to_probs(first_logits, temperature)
+    )  # [1, 1]
 
     cur_ids = torch.cat([input_ids, first_token], dim=1)  # [1, num_input+1]
     start = num_input  # absolute position index of the current accepted (seed) token
 
     acceptance_lengths: List[int] = []
+    proposal_lengths: List[int] = []
     accepted_draft_lengths: List[int] = []
 
     if _contains_stop(first_token, stop_token_ids):
         return {
             "acceptance_lengths": acceptance_lengths,
+            "proposal_lengths": proposal_lengths,
             "accepted_draft_lengths": accepted_draft_lengths,
             "num_input": num_input,
             "num_output": 1,
         }
 
     while start < max_length:
-        # ---- (a) PROPOSE: draft block_size tokens ----
+        # ---- (a) PROPOSE: draft block_size tokens + their per-position probs ----
         draft_input_ids = torch.full(
             (1, block_size), int(mask_token_id), dtype=torch.long, device=device
         )
@@ -336,47 +419,101 @@ def _spec_decode_sample(
             is_causal=False,
         )  # [1, block_size, h]
         base_logits = target_lm_head(block_hidden)  # [1, block_size, vocab]
-        draft_tokens = _draft_block_tokens(
+        draft_tokens, draft_logits = _draft_block_tokens(
             draft_model,
             base_logits,
             seed_token=draft_input_ids[:, 0],
             temperature=temperature,
-        )  # [1, block_size]
+        )  # [1, block_size], [1, block_size, vocab]
+        draft_probs = logits_to_probs(draft_logits, temperature)  # [1, B, vocab]
 
-        # ---- (b) VERIFY: re-prefill [accepted_token, draft_0..draft_{B-1}] ----
+        # verify_input_ids: slot 0 = current accepted token, slots 1.. = drafts.
+        verify_input_ids = torch.cat(
+            [cur_ids[:, start : start + 1], draft_tokens], dim=1
+        )  # [1, 1+B]
+
+        # ---- (b) VERIFY: re-prefill the whole growing sequence + drafts ----
+        # There is no KV-cache incremental decode on the sglang backend, so we
+        # re-prefill; under greedy this is numerically identical to DeepSpec's
+        # KV-cache verify path (same prefix -> same logits at every position).
         verify_ids = torch.cat([cur_ids, draft_tokens], dim=1)  # [1, start+1+B]
         v_ones = torch.ones_like(verify_ids)
         vout = target_model.generate_dflash_data(verify_ids, v_ones, v_ones)
         if vout.last_hidden_states is None:
             raise RuntimeError("target backend did not surface last_hidden_states.")
         v_last = vout.last_hidden_states.to(device=device, dtype=dtype)
-        target_argmax = torch.argmax(target_lm_head(v_last), dim=-1)  # [1, start+1+B]
+        # target logits over [accepted_token, draft_0..draft_{B-1}] == DeepSpec's
+        # target_output.logits [1, 1+B, V] (positions start..start+B of the
+        # re-prefill mirror the KV-cache forward over verify_input_ids).
+        target_logits = target_lm_head(
+            v_last[:, start : start + block_size + 1, :]
+        )  # [1, 1+B, vocab]
+        target_probs = logits_to_probs(target_logits, temperature)  # [1, 1+B, vocab]
 
-        # posterior for draft slot j = target argmax at position start+j.
-        posterior = target_argmax[0, start : start + block_size]  # [B]
-        matches = draft_tokens[0] == posterior
-        accept = int(matches.cumprod(dim=0).sum().item())  # in [0, block_size]
-        bonus = target_argmax[0, start + accept]  # target's own token (always taken)
+        # ---- (c) ACCEPT: DeepSpec rejection sampling ----
+        proposed = verify_input_ids[:, 1:]  # [1, B]
+        sel_t = gather_token_probs(target_probs[:, :-1, :], proposed)  # [1, B]
+        sel_d = gather_token_probs(draft_probs, proposed).clamp_min(1e-8)  # [1, B]
+        accept_prob = torch.clamp(sel_t / sel_d, max=1.0)  # [1, B]
+        accept_mask = (torch.rand_like(accept_prob) < accept_prob).to(torch.int64)
+        accept_prefix = accept_mask.cumprod(dim=1)
+        accepted = int(accept_prefix.sum(dim=1)[0].item())  # in [0, block_size]
 
-        # ---- (c) COMMIT ----
-        accepted_tokens = draft_tokens[:, :accept]  # [1, accept]
-        cur_ids = torch.cat([cur_ids, accepted_tokens, bonus.view(1, 1)], dim=1)
-        new_start = start + accept + 1
+        # ---- EOS: truncate accepted to the first stop token (inclusive) ----
+        effective_proposal_length = block_size
+        terminated_by_stop = False
+        if stop_token_ids and accepted > 0:
+            accepted_slice = verify_input_ids[0, 1 : accepted + 1]
+            stop_tensor = torch.tensor(
+                list(stop_token_ids),
+                device=accepted_slice.device,
+                dtype=accepted_slice.dtype,
+            )
+            eos_hits = torch.isin(accepted_slice, stop_tensor).nonzero(as_tuple=True)[0]
+            if eos_hits.numel() > 0:
+                eos_pos = int(eos_hits[0].item())
+                accepted = eos_pos + 1
+                effective_proposal_length = eos_pos + 1
+                terminated_by_stop = True
+
+        # ---- next token: residual (partial accept) or bonus (full accept). Always
+        # sampled (like DeepSpec) so the RNG stream matches even when terminated. ----
+        if accepted < block_size:
+            next_token = sample_residual(
+                target_probs[:, accepted, :], draft_probs[:, accepted, :]
+            )  # [1]
+        else:
+            next_token = sample_from_probs(target_probs[:, -1:, :]).squeeze(1)  # [1]
+
+        proposal_lengths.append(effective_proposal_length)
+        accepted_draft_lengths.append(accepted)
+        accepted_tokens = draft_tokens[:, :accepted]  # [1, accepted]
+
+        # ---- COMMIT ----
+        if terminated_by_stop:
+            # A stop token is inside the accepted drafts: commit them, drop the
+            # bonus, and stop (DeepSpec's terminated_by_stop_token branch).
+            cur_ids = torch.cat([cur_ids, accepted_tokens], dim=1)
+            acceptance_lengths.append(accepted)
+            break
+
+        cur_ids = torch.cat([cur_ids, accepted_tokens, next_token.view(1, 1)], dim=1)
+        acceptance_lengths.append(accepted + 1)
+        new_start = start + accepted + 1
         # Reuse the verify prefill's aux hidden as the next block's draft context
-        # (positions 0..new_start-1 are all accepted tokens, so their hidden
+        # (positions 0..new_start-1 are all committed tokens, so their hidden
         # states are computed against the correct prefix).
         context = vout.hidden_states[:, :new_start, :].to(device=device, dtype=dtype)
         start = new_start
 
-        acceptance_lengths.append(accept + 1)
-        accepted_draft_lengths.append(accept)
-
-        committed = torch.cat([accepted_tokens, bonus.view(1, 1)], dim=1)
-        if _contains_stop(committed, stop_token_ids):
+        # Stop if the newly committed tokens (accepted drafts + next_token) hit EOS.
+        new_tokens = torch.cat([accepted_tokens, next_token.view(1, 1)], dim=1)
+        if _contains_stop(new_tokens, stop_token_ids):
             break
 
     return {
         "acceptance_lengths": acceptance_lengths,
+        "proposal_lengths": proposal_lengths,
         "accepted_draft_lengths": accepted_draft_lengths,
         "num_input": num_input,
         "num_output": cur_ids.shape[1] - num_input,
@@ -434,7 +571,7 @@ def run_deepspec_eval(
     target_lm_head: torch.nn.Module,
     target_embed_tokens: torch.nn.Module,
     tokenizer,
-    tasks: Sequence[Union[str, Tuple[str, int]]],
+    tasks: Optional[Sequence[Union[str, Tuple[str, int]]]],
     eval_datasets_dir: str,
     *,
     block_size: Optional[int] = None,
@@ -496,6 +633,10 @@ def run_deepspec_eval(
 
     dtype = next(draft_model.parameters()).dtype
 
+    # Default to the single gsm8k task (e.g. the trainer's periodic eval passes
+    # tasks=None); any of the DeepSpec 9 may be requested explicitly.
+    if not tasks:
+        tasks = ["gsm8k"]
     normalized_tasks = _normalize_tasks(tasks, limit_per_task)
 
     per_dataset: Dict[str, Dict[str, object]] = {}
@@ -513,15 +654,21 @@ def run_deepspec_eval(
                 )
                 continue
 
+            # Mirror DeepSpec BaseEvaluator.run_dataset: reseed torch RNG once per
+            # dataset before iterating (per-sample seed_all(seed+idx) follows).
+            seed_all(int(seed))
+
             local_sample_count = 0
             local_proposal_count = 0
-            local_accept_sum = 0
+            local_acceptance_length_sum = 0
+            local_proposal_length_sum = 0
             local_proposals_at_pos = [0] * block_size
             local_accepted_at_pos = [0] * block_size
 
             for global_idx in range(replica_id, len(prompts), num_replicas):
-                # Deterministic per-sample seed (matters only for temperature>0).
-                torch.manual_seed(int(seed) + global_idx)
+                # Deterministic per-sample seed (DeepSpec seed_all(seed+idx));
+                # matters only for temperature>0 sampling.
+                seed_all(int(seed) + global_idx)
                 input_ids = _encode_prompt(
                     tokenizer, prompts[global_idx], device, max_prompt_len
                 )
@@ -545,20 +692,31 @@ def run_deepspec_eval(
                     dtype=dtype,
                 )
                 local_sample_count += 1
-                for accepted_plus_one, accepted in zip(
-                    stats["acceptance_lengths"], stats["accepted_draft_lengths"]
+                # DeepSpec allreduce_response_metrics: acceptance_length_sum,
+                # proposal_length_sum, and per-position tallies keyed on the
+                # *effective* proposal length (block_size or eos_pos+1).
+                for accept_len, prop_len, accepted in zip(
+                    stats["acceptance_lengths"],
+                    stats["proposal_lengths"],
+                    stats["accepted_draft_lengths"],
                 ):
                     local_proposal_count += 1
-                    local_accept_sum += int(accepted_plus_one)
-                    # proposal_length is always block_size, so every position is
-                    # "proposed"; a position is "accepted" iff accepted > k.
+                    local_acceptance_length_sum += int(accept_len)
+                    local_proposal_length_sum += int(prop_len)
                     for pos in range(block_size):
-                        local_proposals_at_pos[pos] += 1
+                        if prop_len > pos:
+                            local_proposals_at_pos[pos] += 1
                         if accepted > pos:
                             local_accepted_at_pos[pos] += 1
 
+            # Reduce integer SUMS (never ratios) over the data-parallel group.
             reduced = _reduce_int_list(
-                [local_sample_count, local_proposal_count, local_accept_sum]
+                [
+                    local_sample_count,
+                    local_proposal_count,
+                    local_acceptance_length_sum,
+                    local_proposal_length_sum,
+                ]
                 + local_proposals_at_pos
                 + local_accepted_at_pos,
                 dp_group,
@@ -566,15 +724,17 @@ def run_deepspec_eval(
             )
             sample_count = reduced[0]
             proposal_count = reduced[1]
-            accept_sum = reduced[2]
-            proposals_at_pos = reduced[3 : 3 + block_size]
-            accepted_at_pos = reduced[3 + block_size : 3 + 2 * block_size]
+            acceptance_length_sum = reduced[2]
+            proposal_length_sum = reduced[3]
+            proposals_at_pos = reduced[4 : 4 + block_size]
+            accepted_at_pos = reduced[4 + block_size : 4 + 2 * block_size]
 
             if proposal_count > 0:
-                mean_accepted_length = accept_sum / proposal_count
-                # proposal_length_sum = block_size * proposal_count.
-                verify_rate = accept_sum / (
-                    block_size * proposal_count + proposal_count
+                # DeepSpec build_metrics_row.
+                mean_accepted_length = acceptance_length_sum / proposal_count
+                draft_tokens_per_proposal = proposal_length_sum / proposal_count
+                verify_rate = acceptance_length_sum / (
+                    proposal_length_sum + proposal_count
                 )
                 accept_rate_at_pos = [
                     (
@@ -586,6 +746,7 @@ def run_deepspec_eval(
                 ]
             else:
                 mean_accepted_length = 0.0
+                draft_tokens_per_proposal = 0.0
                 verify_rate = 0.0
                 accept_rate_at_pos = [None] * block_size
 
@@ -593,11 +754,11 @@ def run_deepspec_eval(
                 "num_samples": sample_count,
                 "num_proposals": proposal_count,
                 "mean_accepted_length": mean_accepted_length,
-                "draft_tokens_per_proposal": float(block_size),
+                "draft_tokens_per_proposal": draft_tokens_per_proposal,
                 "verify_rate": verify_rate,
                 "accept_rate_at_pos": accept_rate_at_pos,
             }
-            overall_accept_sum += accept_sum
+            overall_accept_sum += acceptance_length_sum
             overall_proposal_count += proposal_count
             overall_sample_count += sample_count
 
@@ -666,7 +827,10 @@ def _print_summary(result: Dict[str, object]) -> None:
     overall = result["overall"]
     lines = []
     lines.append("=" * 78)
-    lines.append("DeepSpec speculative-decoding eval  (mean accepted length, greedy)")
+    lines.append(
+        "DeepSpec speculative-decoding eval  "
+        "(mean accepted length, rejection-sampling verify)"
+    )
     lines.append("-" * 78)
     lines.append(
         f"{'dataset':<16s} {'n':>5s} {'#prop':>8s} "
@@ -772,29 +936,32 @@ def parse_args() -> argparse.Namespace:
         "--tasks",
         type=str,
         nargs="+",
-        default=[name for name, _ in DEFAULT_TASKS],
-        help="Task names to evaluate (default: the DeepSpec 9).",
+        default=["gsm8k"],
+        help="Task names to evaluate (default: gsm8k). Any of the DeepSpec 9 "
+        f"are accepted: {', '.join(name for name, _ in DEFAULT_TASKS)}.",
     )
     eval_group.add_argument(
         "--max-new-tokens",
         type=int,
-        default=512,
-        help="Max generated tokens per prompt (DeepSpec uses 2048; keep small "
-        "because verification re-prefills, making it O(n^2)).",
+        default=2048,
+        help="Max generated tokens per prompt (DeepSpec gsm8k protocol: 2048). "
+        "Verification re-prefills, so this is O(n^2); shrink for a quick sweep.",
     )
     eval_group.add_argument(
         "--limit-per-task",
         type=int,
-        default=64,
-        help="Max prompts per dataset (subsampled deterministically). "
-        "Set <=0 to use each task's full upstream cap.",
+        default=500,
+        help="Max prompts per dataset (subsampled deterministically; DeepSpec "
+        "gsm8k protocol: 500). Set <=0 to use each task's full upstream cap.",
     )
     eval_group.add_argument(
         "--temperature",
         type=float,
         default=0.0,
-        help="Draft proposal temperature. Acceptance is greedy argmax-match; "
-        "only 0.0 is exact (see stochastic-rejection TODO).",
+        help="Sampling temperature. The verify is DeepSpec's exact "
+        "rejection-sampling test at ANY temperature; 0.0 (default) is greedy = "
+        "deterministic and bit-exact vs DeepSpec-greedy, while DeepSpec's "
+        "stochastic protocol uses 1.0.",
     )
     eval_group.add_argument(
         "--max-prompt-len",
