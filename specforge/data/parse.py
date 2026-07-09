@@ -474,3 +474,21 @@ class ThinkingParser(GeneralParser):
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )
+
+
+class GLMParser(GeneralParser):
+    """Parser for GLM-5.2 (glm_moe_dsa), which uses inline ``<think>...</think>``.
+
+    GLM's chat template defaults to *thinking* mode (`enable_thinking` unset ⇒ True),
+    which (a) inserts a leading ``<|system|>Reasoning Effort: ...`` turn and (b) opens
+    an unclosed ``<think>`` for the generation prompt. Our data is regenerated in
+    NON-thinking mode and the accept-length eval runs non-thinking, so we force
+    ``enable_thinking=False`` at render time. For stored assistant messages (no
+    ``reasoning_content``) this yields ``<|assistant|><think></think>{content}`` — the
+    empty think block is part of the assistant header (registered in the template), so
+    the loss mask covers only the generated content. Everything else is GeneralParser.
+    """
+
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        kwargs.setdefault("enable_thinking", False)
+        return super().apply_chat_template(messages, tool, **kwargs)
