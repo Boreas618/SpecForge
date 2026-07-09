@@ -244,6 +244,13 @@ def parse_args():
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--eval-interval", type=int, default=1000)
+    output_group.add_argument(
+        "--evals-per-epoch",
+        type=int,
+        default=None,
+        help="If set, overrides --eval-interval so the accept-length eval runs "
+        "this many times per epoch (eval_interval = micro_steps_per_epoch // N).",
+    )
     output_group.add_argument("--save-interval", type=int, default=1000)
 
     optimization_group = parser.add_argument_group("optimization")
@@ -546,8 +553,14 @@ def _maybe_run_accept_length_eval(
                 tracker.log(logd, step=global_step)
             print_on_rank0(f"[accept-length eval @ step {global_step}] {overall}")
     except Exception as e:  # noqa: BLE001
+        # Do NOT silently swallow: print the full traceback so eval failures are
+        # visible in the logs. Training still continues (a periodic-eval failure
+        # must not kill a multi-day run), but the problem is not hidden.
+        import traceback
+
         print_on_rank0(
-            f"[accept-length eval] skipped (error: {type(e).__name__}: {e})"
+            f"[accept-length eval] FAILED at step {global_step} (training "
+            f"continues) — {type(e).__name__}: {e}\n{traceback.format_exc()}"
         )
         try:
             draft_model.train()
@@ -640,6 +653,15 @@ def main():
     total_steps = args.num_epochs * steps_per_epoch
     print_on_rank0(f"Total training steps: {total_steps}")
 
+    # eval cadence: --evals-per-epoch overrides --eval-interval (in micro-steps, the
+    # unit global_step counts). e.g. 10 evals/epoch => every len(dataloader)//10 steps.
+    if args.evals_per_epoch:
+        args.eval_interval = max(1, len(train_dataloader) // args.evals_per_epoch)
+        print_on_rank0(
+            f"eval every {args.eval_interval} micro-steps "
+            f"(~{args.evals_per_epoch} evals/epoch)"
+        )
+
     print_on_rank0("Loading target embeddings and head...")
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
@@ -700,6 +722,16 @@ def main():
         )
     dspark_model = FSDP(dspark_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
+
+    # torch.compile the (FSDP-wrapped) model. Compiled AFTER FSDP is the supported
+    # ordering (FSDP comm hooks stay outermost; the draft decoder blocks + flex
+    # attention compile, while the objective's data-dependent ops — all_reduce,
+    # .item(), the vocab-softmax — graph-break cleanly). dynamic=True: draft
+    # Q/context lengths vary per batch (data-dependent num_anchors). Enabled by
+    # SPECFORGE_COMPILE_DRAFT (the GLM run script sets it =1); set =0 to disable.
+    if os.environ.get("SPECFORGE_COMPILE_DRAFT", "0") == "1":
+        dspark_model = torch.compile(dspark_model, dynamic=True)
+        print_with_rank("Applied torch.compile to dspark_model (SPECFORGE_COMPILE_DRAFT=1)")
 
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]

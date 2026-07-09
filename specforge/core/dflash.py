@@ -68,6 +68,7 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     return final_mask
 
 
+@torch.compiler.disable
 def create_dflash_block_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
