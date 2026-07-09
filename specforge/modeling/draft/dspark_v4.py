@@ -56,10 +56,10 @@ from torch.nn.attention.flex_attention import BlockMask  # noqa: E402
 
 from specforge.modeling.draft.dspark import VanillaMarkov
 
-# head_dim=512 forces small flex tiles on SM100 (larger OOMs shared memory; smaller
-# crashes). flash-attn-4 rejects symmetric head_dim=512 and the FA4 flex backend hits
-# a misaligned-address CUDA error, so the Triton flex kernel at BLOCK 32 is the only
-# stable fused option. Compiled once, reused across all draft layers.
+# DeepSeek-V4 draft attention has one shared KV head. We expand that KV head as a
+# zero-stride view before flex_attention instead of using enable_gqa=True because
+# PyTorch 2.9's flex GQA specialization miscompiles this 64q/1kv, head_dim=512 case
+# on SM100. This keeps block-sparse flex attention without materializing dense scores.
 _FLEX_KERNEL_OPTIONS = {
     "BLOCK_M": 32, "BLOCK_N": 32,
     "BLOCK_M1": 32, "BLOCK_N1": 32,
@@ -133,14 +133,15 @@ class DSparkV4Attention(DeepseekV4Attention):
         if isinstance(attention_mask, BlockMask):
             # Block-sparse flex attention: never materializes the [B,64,Q,S+Q] score
             # matrix, so cost tracks the ~sliding_window keys actually attended, not S.
-            # GQA 64 query heads over the single shared KV head; K==V passed twice.
+            # K==V, with the single shared KV head expanded as a zero-stride view to
+            # avoid the broken flex GQA specialization on this stack.
+            kv_flex = kv.expand(-1, q.shape[1], -1, -1)
             attn_out, lse = _flex_attention_compiled(
                 q,
-                kv,
-                kv,
+                kv_flex,
+                kv_flex,
                 block_mask=attention_mask,
                 scale=self.scaling,
-                enable_gqa=True,
                 return_lse=True,
                 kernel_options=_FLEX_KERNEL_OPTIONS,
             )  # attn_out [B, num_heads, Q, D], lse [B, num_heads, Q]
