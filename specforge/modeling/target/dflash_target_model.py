@@ -6,8 +6,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    prepare_mlp_sync_batch_raw,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -189,6 +193,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         tree_cache = RadixCache(cache_params)
 
         for req in reqs:
+            # DP-attention expects one logprob-alignment token per request when
+            # return_logprob=False. Start at the final prompt token so long
+            # prompts do not look like full-prompt logprob requests.
+            if not req.return_logprob:
+                req.logprob_start_len = max(len(req.origin_input_ids) - 1, 0)
             req.init_next_round_input(tree_cache)
             # Admit the full request in one shot (what PrefillAdder does for
             # unchunked prefill); get_fill_ids() truncates by fill_len.
@@ -206,15 +215,21 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         batch.prepare_for_extend()
 
         if require_mlp_sync(self.model_runner.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
+            # sglang >=0.5.10: prepare_mlp_sync_batch_raw moved from a Scheduler
+            # staticmethod to a free function in scheduler_components.dp_attn, and
+            # the signature changed (dropped spec_algorithm / speculative_num_draft_
+            # tokens; added the now-required attn_cp_size; attn_tp_size comes from
+            # get_attention_tp_size() = tp_size // dp_size, i.e. 1 under full
+            # DP-attention). This branch is only taken when DP-attention is enabled
+            # (require_mlp_sync -> dp_size>1); the old call crashed against 0.5.14.
+            prepare_mlp_sync_batch_raw(
                 batch,
                 dp_size=self.model_runner.server_args.dp_size,
-                attn_tp_size=1,
+                attn_tp_size=get_attention_tp_size(),
+                attn_cp_size=getattr(self.model_runner, "attn_cp_size", 1),
                 tp_group=self.model_runner.tp_group,
                 get_idle_batch=None,
                 disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
                 require_mlp_tp_gather=require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
