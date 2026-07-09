@@ -47,7 +47,15 @@ WORLD=$((NNODES * NUM_GPUS))               # = 16
 #   (/dev/infiniband); DeepEP/NVSHMEM cannot init otherwise (IBGDA/IBRC fail).
 #   Set APPROACH=1 only after the devbox is relaunched with RDMA.
 APPROACH=${APPROACH:-2}
-if [ "$APPROACH" = "2" ]; then DATA_STREAMS=$NNODES; else DATA_STREAMS=$WORLD; fi
+if [ "$APPROACH" = "2" ]; then
+  DATA_STREAMS=$NNODES
+  # Per-NODE batch: the tp=4 target prefills all 4 samples in one cooperative
+  # pass, then TP-batch scatter trains the draft on 1 distinct sample per rank
+  # (16 unique streams; draft compute deduplicated). ACC recomputes below.
+  BATCH_SIZE=${BATCH_SIZE:-4}
+else
+  DATA_STREAMS=$WORLD
+fi
 MASTER_ADDR=${MASTER_ADDR:-10.41.203.21}   # rank-0 routable IP (rendezvous)
 MASTER_PORT=${MASTER_PORT:-29500}
 # Other nodes (for optional rank0->node checkpoint/data sync). rank order 0..3.
@@ -199,6 +207,18 @@ cmd_train() {
   # Set =0 to instead crash on a bad sample (to catch it).
   export SPECFORGE_SANITIZE_NONFINITE=${SPECFORGE_SANITIZE_NONFINITE:-1}
   export SPECFORGE_DEBUG_NONFINITE=${SPECFORGE_DEBUG_NONFINITE:-1}
+  # Chunked DSpark objective: slice the block dim so the [nb,7,155k] logit/prob
+  # stack peaks at ~4 GB instead of ~25 GB (the step-46 OOM next to the sglang
+  # pool). Validated bit-equivalent to the full path. 0 = legacy full path.
+  export SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=${SPECFORGE_OBJECTIVE_CHUNK_BLOCKS:-128}
+  # Train each rank's draft on a distinct 1/tp slice of the node batch (the tp
+  # target already gives every rank identical hiddens; without scatter the
+  # draft grads are just computed tp_size times). 0 = replicate like before.
+  export SPECFORGE_TP_BATCH_SCATTER=${SPECFORGE_TP_BATCH_SCATTER:-1}
+  # Kill allocator fragmentation (the OOM report showed 12.8 GB reserved-but-
+  # unallocated). Safe here: the in-process sglang engine runs with
+  # disable_cuda_graph=True.
+  export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
   # Draft attention: Triton flex (handles the data-dependent dual-source BlockMask).
