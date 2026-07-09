@@ -25,11 +25,10 @@ from torch.nn.attention.flex_attention import create_block_mask
 from specforge.core.dspark import OnlineDSparkModel
 from specforge.modeling.draft.dspark_v4 import DSparkV4DraftModel
 
-# "flex" (default): block-sparse flex attention over the dual-source + sliding-window
-# mask (skips the ~50x masked keys, no [B,64,Q,S+Q] score matrix). "eager": the dense
-# additive-bias fallback (kept for A/B correctness checks). Set SPECFORGE_DRAFT_ATTN=eager
-# to fall back.
-_DRAFT_ATTN = os.environ.get("SPECFORGE_DRAFT_ATTN", "flex")
+# Optional override for the DSpark-V4 draft attention path. By default we honor the
+# `attention_backend` passed by the trainer; set SPECFORGE_DRAFT_ATTN=flex to opt
+# into block-sparse flex attention for experiments.
+_DRAFT_ATTN_OVERRIDE = os.environ.get("SPECFORGE_DRAFT_ATTN")
 
 
 class OnlineDSparkV4Model(OnlineDSparkModel):
@@ -92,8 +91,7 @@ class OnlineDSparkV4Model(OnlineDSparkModel):
     ):
         """Block-sparse flex ``BlockMask`` [B, 1, N*bs, S+N*bs] — same semantics as the
         additive :meth:`_build_dual_source_mask`, but flex skips the fully-masked key
-        blocks instead of materializing the dense score matrix. BLOCK_SIZE 32 is
-        mandatory at head_dim=512 on SM100 (see dspark_v4._FLEX_KERNEL_OPTIONS)."""
+        blocks instead of materializing the dense score matrix."""
         B, N = anchor_positions.shape
         bs = self.block_size
         Q = N * bs
@@ -147,7 +145,8 @@ class OnlineDSparkV4Model(OnlineDSparkModel):
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
         draft_position_ids = self._create_position_ids(anchor_positions)
-        if _DRAFT_ATTN == "flex":
+        attention_backend = (_DRAFT_ATTN_OVERRIDE or self.attention_backend).lower()
+        if attention_backend in ("flex", "flex_attention"):
             attn_mask = self._build_dual_source_block_mask(
                 anchor_positions, block_keep_mask, seq_len, device
             )
