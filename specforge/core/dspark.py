@@ -31,12 +31,31 @@ Key SpecForge differences vs TorchSpec (see port notes in the PR):
     by ``generate_dflash_data`` and fed straight to the draft as ``target_hidden``.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _finite_report(name: str, t: Optional[torch.Tensor]) -> str:
+    """One-line finiteness summary of a tensor (for non-finite loss debugging)."""
+    if t is None:
+        return f"{name}=None"
+    td = t.detach()
+    finite = torch.isfinite(td)
+    n_bad = int((~finite).sum())
+    if n_bad == 0:
+        return f"{name}=finite"
+    has_inf = bool(torch.isinf(td).any())
+    has_nan = bool(torch.isnan(td).any())
+    absmax = float(td[finite].abs().max()) if bool(finite.any()) else float("nan")
+    return (
+        f"{name}={n_bad}/{td.numel()} nonfinite "
+        f"(inf={has_inf} nan={has_nan} finite_absmax={absmax:.3e})"
+    )
 
 from specforge.core.dflash import (
     FLEX_ATTENTION_AVAILABLE,
@@ -128,6 +147,48 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+
+        # Non-finite inputs (captured target hidden states) poison the whole
+        # objective: fc(inf) -> inf logits -> CE = +inf. Catch it at the source so
+        # a bad FP8-target capture is not misdiagnosed as an objective/draft bug.
+        if os.environ.get("SPECFORGE_DEBUG_NONFINITE", "1") == "1":
+            for _nm, _t in (
+                ("hidden_states(context)", hidden_states),
+                ("last_hidden_states(target_final)", last_hidden_states),
+            ):
+                if _t is not None and not bool(torch.isfinite(_t).all()):
+                    _r = dist.get_rank() if dist.is_initialized() else 0
+                    print(
+                        f"[NONFINITE-INPUT rank{_r}] {_finite_report(_nm, _t)} "
+                        f"shape={tuple(_t.shape)}",
+                        flush=True,
+                    )
+
+        # Opt-in robustness (default OFF): under genuine DP the gradient all-reduce
+        # propagates one rank's non-finite sample to all ranks, so a single bad
+        # capture over 1.5M samples can NaN the whole run. When enabled, drop
+        # non-finite tokens from supervision (loss_mask -> 0) AND zero their hidden
+        # so the inf cannot leak into good tokens through the draft's attention.
+        if os.environ.get("SPECFORGE_SANITIZE_NONFINITE", "0") == "1":
+            ctx_finite = torch.isfinite(hidden_states).all(dim=-1)  # [B, S]
+            tgt_finite = (
+                torch.isfinite(last_hidden_states).all(dim=-1)
+                if last_hidden_states is not None
+                else ctx_finite
+            )
+            bad_tok = ~(ctx_finite & tgt_finite)
+            if bool(bad_tok.any()):
+                _r = dist.get_rank() if dist.is_initialized() else 0
+                print(
+                    f"[SANITIZE rank{_r}] excluding {int(bad_tok.sum())}/{bad_tok.numel()} "
+                    f"non-finite tokens from supervision",
+                    flush=True,
+                )
+                loss_mask = loss_mask * (~bad_tok).to(loss_mask.dtype)
+                _z = dict(nan=0.0, posinf=0.0, neginf=0.0)
+                hidden_states = torch.nan_to_num(hidden_states, **_z)
+                if last_hidden_states is not None:
+                    last_hidden_states = torch.nan_to_num(last_hidden_states, **_z)
 
         # ---- DFlash backbone (identical construction to OnlineDFlashModel.forward) ----
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
@@ -354,6 +415,22 @@ class OnlineDSparkModel(OnlineDFlashModel):
             + self.l1_loss_alpha * l1_num / global_den
             + self.confidence_head_alpha * conf_num / global_den
         ) * world_size
+
+        # Fires only when the loss is already broken -> no cost on the healthy
+        # path. Pinpoints which numerator went non-finite and whether the draft
+        # logits / target hidden are the source (vs a degenerate denominator).
+        if not bool(torch.isfinite(loss)):
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"[NONFINITE-LOSS rank{_r}] loss={float(loss):.3e} "
+                f"ce_num={float(ce_num):.3e} l1_num={float(l1_num):.3e} "
+                f"conf_num={float(conf_num):.3e} "
+                f"local_den={float(local_den):.3e} global_den={float(global_den):.3e} | "
+                f"{_finite_report('draft_hidden', draft_hidden)} | "
+                f"{_finite_report('base_logits', base_logits)} | "
+                f"{_finite_report('last_hidden', last_hidden_states)}",
+                flush=True,
+            )
 
         # Per-component loss values (per-rank local means) for logging only — lets
         # you watch L1 fall while the greedy-CE proxy plateaus.
