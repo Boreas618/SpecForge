@@ -68,7 +68,12 @@ from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dspark import OnlineDSparkModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
-from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
+from specforge.distributed import (
+    destroy_distributed,
+    get_dp_group,
+    get_tp_group,
+    init_distributed,
+)
 from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
@@ -826,6 +831,41 @@ def main():
     tracker = create_tracker(args, args.output_dir)
     print_on_rank0("Tracker initialized successfully.")
 
+    # ---- TP-batch scatter (tp-replicated-target topology, e.g. Approach 2) ----
+    # Without DP-attention the target runs TP over the node's ranks, so every
+    # rank holds the SAME node-batch and identical target hiddens after the
+    # cooperative prefill. Training the draft on the full batch on every rank
+    # just computes tp_size identical-gradient copies (FSDP averages them back
+    # to the same update). Scatter instead: each rank keeps a distinct
+    # 1/tp_size slice (trimmed to its own max true length) -> tp_size x less
+    # draft compute per sample and per-rank-unique data, at bit-identical
+    # optimization semantics (the pooled-global-mean loss all-reduces its
+    # denominator over the world either way).
+    _use_dp_attention = (
+        args.target_model_backend == "sglang" and args.sglang_enable_dp_attention
+    )
+    _tp_group = get_tp_group()
+    _tp_size = dist.get_world_size(_tp_group) if _tp_group is not None else 1
+    tp_scatter = (
+        os.environ.get("SPECFORGE_TP_BATCH_SCATTER", "1") == "1"
+        and not _use_dp_attention
+        and _tp_size > 1
+        and args.batch_size % _tp_size == 0
+    )
+    tp_scatter_rank = dist.get_rank(_tp_group) if tp_scatter else 0
+    if _tp_size > 1 and not _use_dp_attention:
+        if tp_scatter:
+            print_on_rank0(
+                f"TP-batch scatter ON: node batch {args.batch_size} -> "
+                f"{args.batch_size // _tp_size} sample(s)/rank across tp={_tp_size}"
+            )
+        else:
+            print_on_rank0(
+                f"TP-batch scatter OFF (env or batch_size {args.batch_size} "
+                f"not divisible by tp={_tp_size}); draft compute is replicated "
+                f"{_tp_size}x per node"
+            )
+
     last_time = time.time()
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
     stop = False
@@ -866,6 +906,23 @@ def main():
                     "Use --target-model-backend hf, or run CE-only with "
                     "--l1-loss-alpha 0 --no-confidence-head."
                 )
+
+            if tp_scatter:
+                # Keep this rank's slice of the node batch and trim its right
+                # padding (collator pads right; positions >= true length carry
+                # no loss tokens, so anchors never reference them). contiguous()
+                # matters: sliced views send cuBLAS down a ~35x slower batched-
+                # GEMM path in the fc/lm_head linears.
+                _per = input_ids.size(0) // _tp_size
+                _sl = slice(tp_scatter_rank * _per, (tp_scatter_rank + 1) * _per)
+                _keep = max(int(attention_mask[_sl].sum(dim=1).max().item()), 1)
+                input_ids = input_ids[_sl, :_keep].contiguous()
+                loss_mask = loss_mask[_sl, :_keep].contiguous()
+                hidden_states = hidden_states[_sl, :_keep].contiguous()
+                if last_hidden_states is not None:
+                    last_hidden_states = last_hidden_states[
+                        _sl, :_keep
+                    ].contiguous()
 
             (
                 loss,
