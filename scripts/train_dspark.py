@@ -904,6 +904,7 @@ def main():
             )
 
     last_time = time.time()
+    last_global_grad_norm = None
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
     stop = False
 
@@ -986,7 +987,15 @@ def main():
                 # its own it clips each shard by its LOCAL norm — a ~sqrt(world)x
                 # looser, non-uniform threshold under sharding.
                 if hasattr(dspark_model, "clip_grad_norm_"):
-                    dspark_model.clip_grad_norm_(args.max_grad_norm)
+                    # Returned value = the PRE-clip global grad norm across all
+                    # shards — the collapse-forensics signal we were missing:
+                    # gradient explosion shows here as >> max_norm; curvature /
+                    # step-size instability (Adam's update magnitude ~lr,
+                    # independent of grad scale, which clipping cannot bound)
+                    # shows a collapse WITHOUT this ever spiking.
+                    last_global_grad_norm = float(
+                        dspark_model.clip_grad_norm_(args.max_grad_norm)
+                    )
                 _scale = lr_scale_global
                 if rewarm_left > 0:
                     # Post-resume LR re-warm (see resume block), composed with
@@ -1015,6 +1024,11 @@ def main():
                     v = value.clone().float()
                     dist.all_reduce(v)
                     comp_log[key] = (v / dist.get_world_size()).item()
+                if last_global_grad_norm is not None:
+                    # Already global (FSDP all-reduces inside clip_grad_norm_);
+                    # value from the most recent optimizer step (<= ACC micro
+                    # steps stale).
+                    comp_log["grad_norm"] = last_global_grad_norm
 
                 record_metrics(
                     args,
