@@ -801,6 +801,29 @@ def main():
         offload_master=os.environ.get("SPECFORGE_OFFLOAD_MASTER", "0") == "1",
     )
 
+    # Persistent LR scale (SPECFORGE_LR_SCALE, default 1.0 = the DeepSpec-parity
+    # schedule). The converged drafter went edge-of-stability at the schedule's
+    # peak LR twice (collapse onset within ~3 optimizer steps of running at
+    # 5.76e-4, at two different data positions; stable through the entire damped
+    # re-warm both times) -> run the same cosine shape scaled down. Applied via
+    # optimizer.step(lr_scale=...), which restores the group lr before the
+    # recurrent scheduler advances, so the schedule itself stays exact.
+    lr_scale_global = float(os.environ.get("SPECFORGE_LR_SCALE", "1.0"))
+    if lr_scale_global != 1.0:
+        print_on_rank0(f"SPECFORGE_LR_SCALE={lr_scale_global}: effective LR = "
+                       f"{lr_scale_global} x schedule")
+    # Every rank MUST use the same scale or the sharded updates diverge — verify.
+    _scale_t = torch.tensor([lr_scale_global], device=device, dtype=torch.float64)
+    _scale_min, _scale_max = _scale_t.clone(), _scale_t.clone()
+    dist.all_reduce(_scale_min, op=dist.ReduceOp.MIN)
+    dist.all_reduce(_scale_max, op=dist.ReduceOp.MAX)
+    if not torch.equal(_scale_min, _scale_max):
+        raise RuntimeError(
+            f"SPECFORGE_LR_SCALE differs across ranks "
+            f"(min={_scale_min.item()}, max={_scale_max.item()}); set the same "
+            f"value on every node."
+        )
+
     rewarm_total = rewarm_left = 0
     if resume_state is not None:
         if os.environ.get("SPECFORGE_RESUME_FULL_OPTIM") == "1":
@@ -964,17 +987,20 @@ def main():
                 # looser, non-uniform threshold under sharding.
                 if hasattr(dspark_model, "clip_grad_norm_"):
                     dspark_model.clip_grad_norm_(args.max_grad_norm)
+                _scale = lr_scale_global
                 if rewarm_left > 0:
-                    # Post-resume LR re-warm (see resume block). The damp is
-                    # applied transiently inside optimizer.step() and restored
-                    # before the (recurrent) scheduler advances.
-                    _f = (rewarm_total - rewarm_left + 1) / rewarm_total
-                    optimizer.step(lr_scale=_f)
+                    # Post-resume LR re-warm (see resume block), composed with
+                    # the persistent scale. Both are applied transiently inside
+                    # optimizer.step() and restored before the (recurrent)
+                    # scheduler advances.
+                    _scale *= (rewarm_total - rewarm_left + 1) / rewarm_total
                     rewarm_left -= 1
                     if rewarm_left == 0:
-                        print_on_rank0("LR re-warm complete; back on schedule LR")
-                else:
-                    optimizer.step()
+                        print_on_rank0(
+                            f"LR re-warm complete; effective LR = "
+                            f"{lr_scale_global} x schedule"
+                        )
+                optimizer.step(lr_scale=_scale)
 
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
