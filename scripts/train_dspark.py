@@ -801,21 +801,35 @@ def main():
         offload_master=os.environ.get("SPECFORGE_OFFLOAD_MASTER", "0") == "1",
     )
 
+    rewarm_total = rewarm_left = 0
     if resume_state is not None:
         if os.environ.get("SPECFORGE_RESUME_FULL_OPTIM") == "1":
             # Full resume incl. AdamW moments. Only correct if the checkpoint's
             # flat-param sharding matches this run's exactly; under FSDP the raw
             # per-shard AdamW state saved by BF16Optimizer does NOT reshard onto a
             # fresh wrap -> exp_avg vs grad size mismatch at optimizer.step().
+            # (Also: the checkpoint only holds RANK 0's optimizer shard, so this
+            # is only usable single-rank.)
             optimizer.load_state_dict(resume_state)
             print_on_rank0("Restored FULL optimizer + scheduler state")
         else:
             # Reshard-safe resume (default): restore the LR scheduler + step exactly,
-            # but reset the Adam moments (they re-warm in ~tens of steps). Avoids the
-            # FSDP flat-param reshard mismatch that crashes optimizer.step().
+            # but reset the Adam moments. Avoids the FSDP flat-param reshard
+            # mismatch that crashes optimizer.step().
             optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            # With freshly reset moments the first optimizer steps are sign-like
+            # kicks of ~lr per coordinate (m_hat/sqrt(v_hat) = +-1 at t=1): fatal
+            # for a converged model at full LR (observed: tau 4.06 -> 1.1 within
+            # ~5 opt steps of a mid-run resume). Linearly re-warm the LR over the
+            # first N optimizer steps so v_hat re-estimates on real gradients
+            # while the weights barely move. All ranks compute the identical
+            # factor, so sharded updates stay consistent.
+            rewarm_total = rewarm_left = int(
+                os.environ.get("SPECFORGE_RESUME_LR_REWARM_OPT_STEPS", "64")
+            )
             print_on_rank0(
-                "Restored LR scheduler + step; Adam moments reset (reshard-safe)"
+                "Restored LR scheduler + step; Adam moments reset (reshard-safe); "
+                f"LR re-warm over next {rewarm_total} optimizer steps"
             )
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
@@ -950,7 +964,17 @@ def main():
                 # looser, non-uniform threshold under sharding.
                 if hasattr(dspark_model, "clip_grad_norm_"):
                     dspark_model.clip_grad_norm_(args.max_grad_norm)
-                optimizer.step()
+                if rewarm_left > 0:
+                    # Post-resume LR re-warm (see resume block). The damp is
+                    # applied transiently inside optimizer.step() and restored
+                    # before the (recurrent) scheduler advances.
+                    _f = (rewarm_total - rewarm_left + 1) / rewarm_total
+                    optimizer.step(lr_scale=_f)
+                    rewarm_left -= 1
+                    if rewarm_left == 0:
+                        print_on_rank0("LR re-warm complete; back on schedule LR")
+                else:
+                    optimizer.step()
 
             if global_step % args.log_interval == 0:
                 loss_log = loss.clone()
