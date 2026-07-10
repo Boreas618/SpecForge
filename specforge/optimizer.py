@@ -48,7 +48,7 @@ class BF16Optimizer:
             warmup_steps=int(warmup_ratio * total_steps),
         )
 
-    def step(self):
+    def step(self, lr_scale: float = 1.0):
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 if p.grad is None:
@@ -58,7 +58,19 @@ class BF16Optimizer:
                     mp.grad = g.to("cpu") if self.offload_master else g
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         self.last_grad_norm = grad_norm.detach()
+        # lr_scale: transient LR damp for THIS step only (post-resume moment
+        # re-warm). The original lr must be restored BEFORE scheduler.step():
+        # torch schedulers like CosineAnnealingLR are recurrences on
+        # param_group["lr"], so a damped value left in place would permanently
+        # drag the whole remaining schedule down.
+        if lr_scale != 1.0:
+            _orig_lrs = [g["lr"] for g in self.optimizer.param_groups]
+            for g in self.optimizer.param_groups:
+                g["lr"] = g["lr"] * lr_scale
         self.optimizer.step()
+        if lr_scale != 1.0:
+            for g, _lr in zip(self.optimizer.param_groups, _orig_lrs):
+                g["lr"] = _lr
         self.optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
