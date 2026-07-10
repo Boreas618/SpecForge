@@ -207,6 +207,13 @@ cmd_train() {
   # Set =0 to instead crash on a bad sample (to catch it).
   export SPECFORGE_SANITIZE_NONFINITE=${SPECFORGE_SANITIZE_NONFINITE:-1}
   export SPECFORGE_DEBUG_NONFINITE=${SPECFORGE_DEBUG_NONFINITE:-1}
+  # Effective LR = SCALE x the cosine schedule (schedule shape untouched).
+  # 0.5 after TWO edge-of-stability collapses of the converged drafter at the
+  # schedule's peak (5.76e-4): onset within ~3 opt steps of full LR, at two
+  # different data positions; stable through the damped re-warm both times.
+  # =1.0 restores the DeepSpec-parity 6e-4 recipe; drop to 0.25 if 0.5 collapses.
+  # MUST be identical on all nodes (the trainer cross-checks and aborts if not).
+  export SPECFORGE_LR_SCALE=${SPECFORGE_LR_SCALE:-0.5}
   # Chunked DSpark objective: slice the block dim so the [nb,7,155k] logit/prob
   # stack peaks at ~4 GB instead of ~25 GB (the step-46 OOM next to the sglang
   # pool). Validated bit-equivalent to the full path. 0 = legacy full path.
