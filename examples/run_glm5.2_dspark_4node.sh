@@ -346,10 +346,14 @@ cmd_eval() {
 
   local EVAL_CKPT=${EVAL_CKPT:-$OUTPUT_DIR/BEST_epoch2_step101500_gsm8k4.887}
   local EVAL_TASKS=${EVAL_TASKS:-"gsm8k math500 aime25 humaneval mbpp livecodebench mt-bench alpaca arena-hard-v2"}
-  local EVAL_LIMIT=${EVAL_LIMIT:-128}         # prompts/task (reduced protocol)
-  local EVAL_MAX_NEW=${EVAL_MAX_NEW:-1024}    # DeepSpec gsm8k uses 2048; halved for the sweep
-  local EVAL_TEMP=${EVAL_TEMP:-0.0}           # greedy = deterministic, matches the in-loop evals
-  local EVAL_TAG=${EVAL_TAG:-$(basename "$EVAL_CKPT")}
+  local EVAL_LIMIT=${EVAL_LIMIT:-128}         # prompts/task
+  local EVAL_MAX_NEW=${EVAL_MAX_NEW:-2048}    # DeepSpec protocol; thinking-ON needs room for the reasoning chain
+  local EVAL_TEMP=${EVAL_TEMP:-0.0}           # greedy = deterministic
+  # Thinking-ON by default (GLM-5.2's deployment mode + our training target).
+  # =0 for a thinking-OFF (direct-answer) sweep. MUST match the deployment mode
+  # you report; the two give very different accept lengths.
+  export SPECFORGE_EVAL_ENABLE_THINKING=${SPECFORGE_EVAL_ENABLE_THINKING:-1}
+  local EVAL_TAG=${EVAL_TAG:-$(basename "$EVAL_CKPT")_think${SPECFORGE_EVAL_ENABLE_THINKING}}
   mkdir -p "$OUTPUT_DIR/evals"
 
   if ! python3 -c "import specforge, sglang" 2>/dev/null; then
