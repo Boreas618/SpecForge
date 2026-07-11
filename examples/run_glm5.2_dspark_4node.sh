@@ -70,8 +70,9 @@ LEARNING_RATE=${LEARNING_RATE:-6e-4}
 WARMUP_RATIO=${WARMUP_RATIO:-0.04}
 MAX_LEN=${MAX_LEN:-4096}
 BLOCK_SIZE=${BLOCK_SIZE:-7}                # config-owned; passed for the loss-token filter
-NUM_ANCHORS=${NUM_ANCHORS:-1024}         # RedHat's max_anchors (owner: follow RedHat). Watch the
-                                         # [B,1024,7,154880] objective tensor for OOM; drop if it bites.
+NUM_ANCHORS=${NUM_ANCHORS:-512}          # DeepSpec canonical (all their dspark configs use 512).
+                                         # Was 1024 (RedHat); 512 halves supervision density/step and
+                                         # is the likely reason DeepSpec is stable at unscaled 6e-4.
 MEM_FRAC=${MEM_FRAC:-0.6}                  # target ~47GB/rank at tp16 -> ample room
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
@@ -263,7 +264,7 @@ streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_S
     --output-dir "$OUTPUT_DIR" --cache-dir "$ROOT_DIR/cache" \
     --num-epochs "$NUM_EPOCHS" --batch-size "$BATCH_SIZE" --accumulation-steps "$ACC_STEPS" \
     --learning-rate "$LEARNING_RATE" --warmup-ratio "$WARMUP_RATIO" --max-grad-norm 1.0 --seed 42 \
-    --lr-scale "${LR_SCALE:-0.5}" --resume-lr-rewarm-steps "${RESUME_LR_REWARM_STEPS:-64}" \
+    --lr-scale "${LR_SCALE:-1.0}" --resume-lr-rewarm-steps "${RESUME_LR_REWARM_STEPS:-64}" \
     --max-length "$MAX_LEN" --chat-template "$CHAT_TEMPLATE" \
     --num-anchors "$NUM_ANCHORS" --loss-decay-gamma 4.0 \
     --ce-loss-alpha 0.1 --l1-loss-alpha 0.9 --confidence-head-alpha 1.0 \
@@ -314,9 +315,9 @@ cmd_eval() {
 
   local EVAL_CKPT=${EVAL_CKPT:-$OUTPUT_DIR/BEST_epoch2_step101500_gsm8k4.887}
   local EVAL_TASKS=${EVAL_TASKS:-"gsm8k math500 aime25 humaneval mbpp livecodebench mt-bench alpaca arena-hard-v2"}
-  local EVAL_LIMIT=${EVAL_LIMIT:-128}         # prompts/task
+  local EVAL_LIMIT=${EVAL_LIMIT:-0}           # 0 -> DeepSpec per-task upstream caps (gsm8k 500, aime25 30, ...)
   local EVAL_MAX_NEW=${EVAL_MAX_NEW:-2048}    # DeepSpec protocol; thinking-ON needs room for the reasoning chain
-  local EVAL_TEMP=${EVAL_TEMP:-0.0}           # greedy = deterministic
+  local EVAL_TEMP=${EVAL_TEMP:-1.0}           # DeepSpec default: stochastic rejection-sampling verify
   # Thinking-ON by default (GLM-5.2's deployment mode + our training target).
   # =0 for a thinking-OFF (direct-answer) sweep. MUST match the deployment mode
   # you report; the two give very different accept lengths.

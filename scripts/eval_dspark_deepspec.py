@@ -618,10 +618,18 @@ def _normalize_tasks(
     tasks: Sequence[Union[str, Tuple[str, int]]],
     limit_per_task: Optional[int],
 ) -> List[Tuple[str, Optional[int]]]:
+    # DeepSpec's per-task upstream caps (from DEFAULT_TASKS). When a task is
+    # passed as a bare name with no global limit_per_task, fall back to this cap
+    # so `--tasks gsm8k ... --limit-per-task 0` reproduces DeepSpec's exact
+    # protocol sizes (gsm8k 500, aime25 30, ...) instead of the full jsonl.
+    default_caps = dict(DEFAULT_TASKS)
     normalized: List[Tuple[str, Optional[int]]] = []
     for task in tasks:
         if isinstance(task, str):
-            name, task_limit = task, limit_per_task
+            name = task
+            task_limit = (
+                limit_per_task if limit_per_task is not None else default_caps.get(name)
+            )
         else:
             name, task_limit = task[0], task[1]
             if limit_per_task is not None:
