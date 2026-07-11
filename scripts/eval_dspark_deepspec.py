@@ -332,8 +332,27 @@ def _encode_prompt(
 # ---------------------------------------------------------------------------
 # Core speculative-decoding loop (single prompt, re-prefill verify)
 # ---------------------------------------------------------------------------
+def _kvdbg(msg: str) -> None:
+    if os.environ.get("SPECFORGE_KV_DEBUG") == "1":
+        print(f"[kvdbg] {msg}", flush=True)
+
+
+def _spec_decode_sample(**kwargs):
+    """Wrapper: run one spec-decode sample, always releasing the KV session."""
+    target_model = kwargs["target_model"]
+    try:
+        out = _spec_decode_sample_impl(**kwargs)
+        _kvdbg("impl returned")
+        return out
+    finally:
+        _kvdbg("end_cache_session: begin")
+        if hasattr(target_model, "end_cache_session"):
+            target_model.end_cache_session()
+        _kvdbg("end_cache_session: done")
+
+
 @torch.inference_mode()
-def _spec_decode_sample(
+def _spec_decode_sample_impl(
     *,
     target_model,
     draft_model: DSparkDraftModel,
@@ -364,11 +383,40 @@ def _spec_decode_sample(
     """
     num_input = input_ids.shape[1]
     max_length = num_input + max_new_tokens
+    if os.environ.get("SPECFORGE_KV_DEBUG") == "1":
+        _r = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            f"[kvdbg] r{_r} sample-start num_input={num_input} "
+            f"ids_hash={int(input_ids.sum().item())}",
+            flush=True,
+        )
 
     ones = torch.ones_like(input_ids)
 
-    # ---- Prefill the prompt ----
-    out = target_model.generate_dflash_data(input_ids, ones, ones)
+    # Radix-cache session (sglang backend): committed prefixes are served from
+    # KV cache, so each verify step computes only the ~block_size+1 new tokens
+    # (DeepSpec's incremental-verify cost) instead of an O(n^2) full re-prefill.
+    # Backends without sessions (hf) run the old full-re-prefill path unchanged:
+    # prefix_len stays 0 and every slice below reduces to absolute indexing.
+    # SPECFORGE_EVAL_KV_REUSE=0 forces the old path (A/B validation).
+    _cached = (
+        hasattr(target_model, "start_cache_session")
+        and os.environ.get("SPECFORGE_EVAL_KV_REUSE", "1") == "1"
+    )
+
+    def _prefill(ids: torch.Tensor, commit_len: int):
+        ones_ = torch.ones_like(ids)
+        if _cached:
+            return target_model.generate_dflash_data(
+                ids, ones_, ones_, cache_commit_len=commit_len
+            )
+        return target_model.generate_dflash_data(ids, ones_, ones_)
+
+    if _cached:
+        target_model.start_cache_session()
+
+    # ---- Prefill the prompt (commit all prompt tokens to the session cache) ----
+    out = _prefill(input_ids, num_input)
     if out.last_hidden_states is None:
         raise RuntimeError(
             "target backend did not surface last_hidden_states; DeepSpec eval "
@@ -432,21 +480,27 @@ def _spec_decode_sample(
             [cur_ids[:, start : start + 1], draft_tokens], dim=1
         )  # [1, 1+B]
 
-        # ---- (b) VERIFY: re-prefill the whole growing sequence + drafts ----
-        # There is no KV-cache incremental decode on the sglang backend, so we
-        # re-prefill; under greedy this is numerically identical to DeepSpec's
-        # KV-cache verify path (same prefix -> same logits at every position).
+        # ---- (b) VERIFY: submit the grown sequence; the session cache serves
+        # the committed prefix from KV so only the suffix is computed (without a
+        # session this is a full re-prefill — numerically identical either way:
+        # same prefix -> same logits at every position). Commit len = len(cur_ids)
+        # (everything already accepted); the drafts stay uncommitted so the next
+        # match can never overrun the positions the verifier needs.
         verify_ids = torch.cat([cur_ids, draft_tokens], dim=1)  # [1, start+1+B]
-        v_ones = torch.ones_like(verify_ids)
-        vout = target_model.generate_dflash_data(verify_ids, v_ones, v_ones)
+        vout = _prefill(verify_ids, cur_ids.shape[1])
         if vout.last_hidden_states is None:
             raise RuntimeError("target backend did not surface last_hidden_states.")
+        pl = int(vout.prefix_len or 0)  # cached-prefix offset (0 without session)
+        if pl > start:
+            raise RuntimeError(
+                f"cache session over-matched: prefix_len={pl} > start={start}"
+            )
         v_last = vout.last_hidden_states.to(device=device, dtype=dtype)
         # target logits over [accepted_token, draft_0..draft_{B-1}] == DeepSpec's
-        # target_output.logits [1, 1+B, V] (positions start..start+B of the
-        # re-prefill mirror the KV-cache forward over verify_input_ids).
+        # target_output.logits [1, 1+B, V] (absolute positions start..start+B,
+        # i.e. start-pl.. relative to the computed suffix).
         target_logits = target_lm_head(
-            v_last[:, start : start + block_size + 1, :]
+            v_last[:, start - pl : start + block_size + 1 - pl, :]
         )  # [1, 1+B, vocab]
         target_probs = logits_to_probs(target_logits, temperature)  # [1, 1+B, vocab]
 
@@ -502,15 +556,22 @@ def _spec_decode_sample(
         new_start = start + accepted + 1
         # Reuse the verify prefill's aux hidden as the next block's draft context
         # (positions 0..new_start-1 are all committed tokens, so their hidden
-        # states are computed against the correct prefix).
-        context = vout.hidden_states[:, :new_start, :].to(device=device, dtype=dtype)
+        # states are computed against the correct prefix). With a session cache
+        # the verify output covers positions [pl, ...): splice it onto the
+        # retained prefix context (identical values — causal — either way).
+        suffix_ctx = vout.hidden_states[:, : new_start - pl, :].to(
+            device=device, dtype=dtype
+        )
+        context = torch.cat([context[:, :pl, :], suffix_ctx], dim=1)
         start = new_start
 
         # Stop if the newly committed tokens (accepted drafts + next_token) hit EOS.
         new_tokens = torch.cat([accepted_tokens, next_token.view(1, 1)], dim=1)
         if _contains_stop(new_tokens, stop_token_ids):
+            _kvdbg(f"stop-token break at start={start}")
             break
 
+    _kvdbg(f"loop exited: start={start} max_length={max_length}")
     return {
         "acceptance_lengths": acceptance_lengths,
         "proposal_lengths": proposal_lengths,
@@ -692,6 +753,11 @@ def run_deepspec_eval(
                     dtype=dtype,
                 )
                 local_sample_count += 1
+                if os.environ.get("SPECFORGE_KV_DEBUG") == "1":
+                    print_on_rank0(
+                        f"[eval-sample] {task_name}#{global_idx} done: "
+                        f"out={stats['num_output']} props={len(stats['proposal_lengths'])}"
+                    )
                 # DeepSpec allreduce_response_metrics: acceptance_length_sum,
                 # proposal_length_sum, and per-position tallies keyed on the
                 # *effective* proposal length (block_size or eos_pos+1).
@@ -764,6 +830,23 @@ def run_deepspec_eval(
 
             if verbose:
                 _print_dataset_row(task_name, per_dataset[task_name])
+            # Long sweeps: make row output visible immediately and checkpoint
+            # partial results so a late failure cannot lose completed tasks.
+            import sys as _sys
+
+            for _h in (_sys.stdout, _sys.stderr):
+                try:
+                    _h.flush()
+                except Exception:
+                    pass
+            _is_r0 = (
+                not (dist.is_available() and dist.is_initialized())
+            ) or dist.get_rank() == 0
+            if output_json and _is_r0:
+                _partial = output_json + ".partial"
+                os.makedirs(os.path.dirname(os.path.abspath(_partial)), exist_ok=True)
+                with open(_partial, "w", encoding="utf-8") as _f:
+                    json.dump({"per_dataset": per_dataset}, _f, indent=2)
     finally:
         # Restore draft state so training can resume unaffected.
         if prev_attn is not None:
@@ -957,7 +1040,7 @@ def parse_args() -> argparse.Namespace:
     eval_group.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
+        default=1.0,
         help="Sampling temperature. The verify is DeepSpec's exact "
         "rejection-sampling test at ANY temperature; 0.0 (default) is greedy = "
         "deterministic and bit-exact vs DeepSpec-greedy, while DeepSpec's "

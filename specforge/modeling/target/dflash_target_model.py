@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
@@ -38,6 +39,10 @@ class DFlashTargetOutput:
     # to form the soft next-token distribution). None when the backend does not
     # surface it (then DSpark must run CE-only).
     last_hidden_states: Optional[torch.Tensor] = None
+    # When a radix-cache session is active (start_cache_session), hidden_states/
+    # last_hidden_states cover only positions [prefix_len, seq_len) — the prefix
+    # was served from KV cache and not recomputed. None outside sessions.
+    prefix_len: Optional[int] = None
 
 
 class DFlashTargetModel(ABC):
@@ -221,15 +226,45 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         inner.forward = _forward_with_final
         inner._dspark_final_appended = True
 
-    @torch.no_grad
-    def _extend(self, reqs):
+    def start_cache_session(self):
+        """Enable persistent radix-cache prefix reuse across generate calls.
+
+        For the speculative-decoding eval: each verify step re-submits the whole
+        growing sequence, but with a persistent RadixCache the matched prefix is
+        served from KV cache and only the new suffix (~block_size+1 tokens) is
+        computed — DeepSpec's incremental-verify cost (their DynamicCache +
+        crop()) on the tp-sharded sglang target, instead of an O(n^2) full
+        re-prefill per step. Only committed tokens are inserted into the tree
+        (``cache_commit_len``), so the computed suffix provably covers every
+        position the verifier needs. Batch size must be 1 while a session is
+        active. Call :meth:`end_cache_session` to release the cached KV.
+        """
         cache_params = CacheInitParams(
             disable=False,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.server_args.page_size,
         )
-        tree_cache = RadixCache(cache_params)
+        self._session_tree = RadixCache(cache_params)
+
+    def end_cache_session(self):
+        self._session_tree = None
+        self.model_runner.req_to_token_pool.clear()
+        self.model_runner.token_to_kv_pool_allocator.clear()
+
+    @torch.no_grad
+    def _extend(self, reqs, cache_commit_len=None):
+        session_tree = getattr(self, "_session_tree", None)
+        if session_tree is not None:
+            tree_cache = session_tree
+        else:
+            cache_params = CacheInitParams(
+                disable=False,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+                page_size=self.model_runner.server_args.page_size,
+            )
+            tree_cache = RadixCache(cache_params)
 
         for req in reqs:
             # DP-attention expects one logprob-alignment token per request when
@@ -296,7 +331,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         if hasattr(output, "logits_output"):
             output = output.logits_output
 
-        input_lens = [len(req.origin_input_ids) for req in reqs]
+        # Hidden states are returned only for COMPUTED tokens: with an empty
+        # tree (no session) extend_input_len == len(origin_input_ids) and this
+        # is identical to the old full-length split; with a session cache the
+        # matched prefix is served from KV and the output covers the suffix.
+        input_lens = [req.extend_input_len for req in reqs]
+        prefix_lens = [len(req.prefix_indices) for req in reqs]
         # context = the captured (aux) mid-layer concat used by DFlash; final = the
         # post-norm last-layer hidden, surfaced for DSpark's L1 / confidence losses
         # (None if the runner only returned a single hidden stream).
@@ -334,10 +374,48 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         else:
             raise ValueError("SGLang output does not contain hidden states.")
 
-        self.model_runner.req_to_token_pool.clear()
-        self.model_runner.token_to_kv_pool_allocator.clear()
+        if session_tree is not None and os.environ.get("SPECFORGE_KV_DEBUG") == "1":
+            print(f"[KV] fill={reqs[0].fill_len} prefix={len(reqs[0].prefix_indices)} extend={reqs[0].extend_input_len} commit={cache_commit_len}", flush=True)
+        if session_tree is not None:
+            # Persist the KV of the COMMITTED prefix into the session tree so the
+            # next call's prefix match serves it from cache. Only committed
+            # tokens are inserted (cache_commit_len): the uncommitted tail (the
+            # drafted block under verification) is freed, so a future match can
+            # never extend past the committed length — the computed suffix is
+            # guaranteed to cover every position the verifier reads.
+            for req in reqs:
+                fill_len = req.fill_len
+                commit = (
+                    fill_len
+                    if cache_commit_len is None
+                    else max(0, min(int(cache_commit_len), fill_len))
+                )
+                req.kv_committed_len = commit
+                kv_row = self.model_runner.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :fill_len
+                ]
+                # The paged allocator frees WHOLE pages (unique(idx // page)):
+                # cache_finished_req already freed [page_aligned(commit) : commit],
+                # which covers the entire page containing `commit`. Freeing from
+                # an unaligned `commit` would double-free that boundary page (the
+                # same page later gets handed to two sequences). Start our tail
+                # at the first page boundary strictly after commit-1.
+                page = int(self.model_runner.server_args.page_size or 1)
+                tail_start = ((commit - 1) // page + 1) * page if commit > 0 else 0
+                tail = kv_row[tail_start:].to(dtype=torch.int64, copy=True)
+                # Inserts kv[:commit] (freeing the already-cached duplicate
+                # prefix), frees the page-unaligned remainder below `commit`,
+                # and releases the prefix lock from init_next_round_input.
+                tree_cache.cache_finished_req(req)
+                if tail.numel():
+                    self.model_runner.token_to_kv_pool_allocator.free(tail)
+            # Req slots are transient (the tree holds copies of the kv indices).
+            self.model_runner.req_to_token_pool.clear()
+        else:
+            self.model_runner.req_to_token_pool.clear()
+            self.model_runner.token_to_kv_pool_allocator.clear()
 
-        return context_list, final_list
+        return context_list, final_list, prefix_lens
 
     @torch.no_grad()
     def generate_dflash_data(
@@ -345,6 +423,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        cache_commit_len: Optional[int] = None,
     ) -> DFlashTargetOutput:
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
@@ -377,7 +456,24 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             data_cache.append((curr_ids, curr_attn, curr_loss))
             reqs.append(req)
 
-        context_list, final_list = self._extend(reqs)
+        context_list, final_list, prefix_lens = self._extend(
+            reqs, cache_commit_len=cache_commit_len
+        )
+
+        if getattr(self, "_session_tree", None) is not None:
+            # Session mode (spec-decode eval): batch of 1, return the computed
+            # suffix directly with its offset — no re-padding to full length.
+            assert len(context_list) == 1, "cache sessions require batch size 1"
+            return DFlashTargetOutput(
+                hidden_states=context_list[0].unsqueeze(0),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                last_hidden_states=(
+                    final_list[0].unsqueeze(0) if final_list is not None else None
+                ),
+                prefix_len=int(prefix_lens[0]),
+            )
 
         # Stack back to batch, re-padding each row to the batch seq length
         # (requests were prefetched pad-stripped; zeros at pad positions are
