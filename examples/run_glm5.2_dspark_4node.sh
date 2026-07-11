@@ -330,11 +330,57 @@ cmd_watchdog() {
   done
 }
 
+cmd_eval() {
+  # Multi-node DeepSpec accept-length eval (dp=NNODES x tp=NUM_GPUS): each node is
+  # one tp-sharded target replica, prompts sharded across the 4 replicas, metric
+  # sums all-reduced over the dp group -> ~NNODES x throughput vs single node.
+  : "${NODE_RANK:?set NODE_RANK=0/1/2/3}"
+  [ -n "$MASTER_ADDR" ] || { echo "ERROR: MASTER_ADDR unset"; exit 1; }
+  export PYTHONPATH=$ROOT_DIR:${PYTHONPATH:-}
+  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enP22p3s0np0}
+  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
+  export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}     # cross-node NCCL over TCP (metric all-reduce only)
+  export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
+  export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  unset SPECFORGE_DRAFT_FLEX_BACKEND SPECFORGE_SGLANG_MOE_RUNNER_BACKEND || true
+
+  local EVAL_CKPT=${EVAL_CKPT:-$OUTPUT_DIR/BEST_epoch2_step101500_gsm8k4.887}
+  local EVAL_TASKS=${EVAL_TASKS:-"gsm8k math500 aime25 humaneval mbpp livecodebench mt-bench alpaca arena-hard-v2"}
+  local EVAL_LIMIT=${EVAL_LIMIT:-128}         # prompts/task (reduced protocol)
+  local EVAL_MAX_NEW=${EVAL_MAX_NEW:-1024}    # DeepSpec gsm8k uses 2048; halved for the sweep
+  local EVAL_TEMP=${EVAL_TEMP:-0.0}           # greedy = deterministic, matches the in-loop evals
+  local EVAL_TAG=${EVAL_TAG:-$(basename "$EVAL_CKPT")}
+  mkdir -p "$OUTPUT_DIR/evals"
+
+  if ! python3 -c "import specforge, sglang" 2>/dev/null; then
+    echo "ERROR: deps missing on this node. Run: $0 setup" >&2; exit 1
+  fi
+  log "eval: node_rank=$NODE_RANK/$NNODES dp=$NNODES tp=$NUM_GPUS ckpt=$EVAL_CKPT \
+limit=$EVAL_LIMIT max_new=$EVAL_MAX_NEW temp=$EVAL_TEMP tasks=[$EVAL_TASKS]"
+
+  torchrun \
+    --nnodes "$NNODES" --nproc-per-node "$NUM_GPUS" --node-rank "$NODE_RANK" \
+    --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" --max-restarts 0 \
+    "$ROOT_DIR/scripts/eval_dspark_deepspec.py" \
+    --target-model-path "$TARGET_MODEL" --target-model-backend sglang --trust-remote-code \
+    --tp-size "$NUM_GPUS" \
+    --sglang-attention-backend "$SGLANG_ATTN_BACKEND" \
+    --sglang-mem-fraction-static "${MEM_FRAC_A2:-0.78}" --sglang-context-length 8192 \
+    --draft-checkpoint "$EVAL_CKPT" --draft-attention-backend sdpa \
+    --eval-datasets-dir "$EVAL_DATASETS_DIR" \
+    --tasks $EVAL_TASKS \
+    --limit-per-task "$EVAL_LIMIT" --max-new-tokens "$EVAL_MAX_NEW" \
+    --temperature "$EVAL_TEMP" --seed 980406 \
+    --output-json "$OUTPUT_DIR/evals/eval9_${EVAL_TAG}.json" \
+    --dist-timeout 30
+}
+
 case "${1:-}" in
   setup)     cmd_setup ;;
   prepare)   cmd_prepare ;;
   ckptsync)  cmd_ckptsync ;;
   train)     cmd_train ;;
   watchdog)  cmd_watchdog ;;
+  eval)      cmd_eval ;;
   *) sed -n '2,45p' "$SCRIPT_PATH"; echo; echo "ERROR: unknown command '${1:-}'"; exit 1 ;;
 esac
