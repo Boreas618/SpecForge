@@ -153,6 +153,27 @@ class GeneralParser(Parser):
                 + re.escape("] USER:")
                 + "|$))"
             )
+        elif chat_template.assistant_pattern_type == "glm":
+            # GLM-5.2 thinking-hybrid. An assistant turn renders as either
+            #   <|assistant|><think></think>{answer}             (thinking-OFF)
+            #   <|assistant|><think>{reasoning}</think>{answer}   (thinking-ON)
+            # In BOTH the model-generated tokens are what follows the always-
+            # scaffolding "<|assistant|><think>" prefix, EXCEPT the empty
+            # "</think>" of the thinking-OFF header (that close is scaffolding,
+            # not generated). So: match the prefix, optionally swallow an
+            # immediate "</think>" (the thinking-OFF empty block, left
+            # unsupervised), then capture to end-of-turn. This supervises the
+            # full reasoning + </think> + answer for thinking-ON and just the
+            # answer for thinking-OFF. A literal "<|assistant|><think></think>"
+            # header (the old value) matched ONLY thinking-OFF turns, silently
+            # zero-masking every thinking-ON regen sample (~50% of the corpus).
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"(?:</think>)?"
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
+            )
         else:
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
