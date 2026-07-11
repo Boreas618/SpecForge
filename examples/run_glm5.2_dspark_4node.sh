@@ -1,17 +1,27 @@
 #!/bin/bash
-# GLM-5.2 dense DSpark drafter training across FOUR GB300 nodes (16 GPUs), genuine
-# data-parallelism via sglang DP-attention (Approach 1, GLM52_EXECUTION_DOC.md §5).
+# GLM-5.2 dense DSpark drafter training across FOUR GB300 nodes (16 GPUs), with
+# per-node data-parallelism (Approach 2, GLM52_EXECUTION_DOC.md §5).
 #
-# TOPOLOGY: WORLD = NNODES*NUM_GPUS = 4*4 = 16. One logical sglang engine spans all
-#   16 ranks with DP-attention (attn_tp=1 -> each rank forwards its OWN data shard)
-#   + expert-parallel MoE over deepep. Target = zai-org/GLM-5.2-FP8 (~756GB, ~47GB
-#   /rank at tp16, glm_moe_dsa -> sglang "dsa" attention backend, aux+final hidden
-#   captured via set_dflash_layers_to_capture). Draft = dense 5-layer DSpark
-#   (~3.8B), FSDP SHARD_GRAD_OP over 16 ranks (resident params; no CPU offload).
+# TOPOLOGY: WORLD = NNODES*NUM_GPUS = 4*4 = 16. Each NODE runs one tp=NUM_GPUS
+#   sglang engine (intra-node NVLink target, no DeepEP); the draft's FSDP is
+#   data-parallel across nodes over NCCL (TCP if no IB). Target = zai-org/
+#   GLM-5.2-FP8 (~756GB, ~189GB/rank at tp=4, glm_moe_dsa -> sglang "dsa"
+#   attention backend, aux+final hidden captured via set_dflash_layers_to_capture).
+#   The tp=4 target prefills all 4 samples in one cooperative pass, then TP-batch
+#   scatter trains the draft on 1 distinct sample per rank -> WORLD (16) unique
+#   streams; draft compute deduplicated. Draft = dense 5-layer DSpark (~3.8B),
+#   FSDP SHARD_GRAD_OP over 16 ranks (resident params; no CPU offload).
 #   Hidden-state teacher = ONLINE prefill every epoch (no decode, no offline cache;
-#   R-DATA-3). Effective global batch = WORLD*BATCH_SIZE, held to 512 via
-#   ACC = 512/(WORLD*BATCH_SIZE). The DSpark pooled-global-mean objective
-#   (core/dspark.py) is already correct for genuine DP.
+#   R-DATA-3). Effective global batch = DATA_STREAMS*BATCH_SIZE*ACC, held to 512.
+#   The DSpark pooled-global-mean objective (core/dspark.py) is already correct
+#   for this DP.
+#
+#   Validated in this container: no /dev/infiniband, so DeepEP (which forces
+#   IBGDA) cannot init cross-container. The genuine DP-attention path (former
+#   "Approach 1": one logical sglang engine over all 16 ranks via
+#   --sglang-enable-dp-attention + --sglang-moe-a2a-backend deepep) required
+#   cross-node RDMA and has been removed; restore it from git history if the
+#   devbox is ever relaunched with InfiniBand.
 #
 # IMPORTANT — /scratch is NODE-LOCAL. The repo, the ~756GB FP8 target, the mixed
 #   dataset jsonl, and the tokenized cache must exist on ALL FOUR nodes; checkpoints
@@ -21,7 +31,8 @@
 #   1. On EACH node:        bash examples/run_glm5.2_dspark_4node.sh setup
 #   2. On EACH node:        bash examples/run_glm5.2_dspark_4node.sh prepare
 #                           (or run prepare on rank 0 then `sync` if node->node ssh)
-#   3. Smoke first:         SMOKE=1 on ALL nodes (validates DP-attn+deepep+dsa+FP8)
+#   3. Smoke first:         SMOKE=1 on ALL nodes (validates dsa+FP8 target load,
+#                           aux+final capture, TP-batch scatter, draft FSDP)
 #   4. Launch (all nodes):  NODE_RANK=0 MASTER_ADDR=10.41.203.21 ...watchdog  (rank 0)
 #                           NODE_RANK=1 MASTER_ADDR=10.41.203.21 ...watchdog  (rank 1)
 #                           NODE_RANK=2 ...  NODE_RANK=3 ...
@@ -38,46 +49,26 @@ ROOT_DIR=$(dirname "$SCRIPT_DIR")
 NNODES=${NNODES:-4}
 NUM_GPUS=${NUM_GPUS:-4}                    # per node — a GB300 node is 4 GPUs
 WORLD=$((NNODES * NUM_GPUS))               # = 16
-# APPROACH 2 (DEFAULT): one per-NODE tp engine (intra-node NVLink target, no
-#   DeepEP) + cross-node data-parallel over the draft's FSDP (NCCL, TCP if no IB).
-#   -> NNODES unique streams. This is the validated topology in this container
-#   (no /dev/infiniband; DeepEP forces IBGDA which hangs cross-container here).
-# APPROACH 1 (opt-in): genuine DP via sglang DP-attention + DeepEP across all WORLD
-#   ranks -> ~16 unique data streams. REQUIRES cross-node InfiniBand verbs
-#   (/dev/infiniband); DeepEP/NVSHMEM cannot init otherwise (IBGDA/IBRC fail).
-#   Set APPROACH=1 only after the devbox is relaunched with RDMA.
-APPROACH=${APPROACH:-2}
-if [ "$APPROACH" = "2" ]; then
-  DATA_STREAMS=$NNODES
-  # Per-NODE batch: the tp=4 target prefills all 4 samples in one cooperative
-  # pass, then TP-batch scatter trains the draft on 1 distinct sample per rank
-  # (16 unique streams; draft compute deduplicated). ACC recomputes below.
-  BATCH_SIZE=${BATCH_SIZE:-4}
-else
-  DATA_STREAMS=$WORLD
-fi
+DATA_STREAMS=$NNODES
 MASTER_ADDR=${MASTER_ADDR:-10.41.203.21}   # rank-0 routable IP (rendezvous)
 MASTER_PORT=${MASTER_PORT:-29500}
-# Other nodes (for optional rank0->node checkpoint/data sync). rank order 0..3.
 RANK_HOSTS=${RANK_HOSTS:-"10.41.203.23 10.41.202.251 10.41.203.9"}
 
-# ---- recipe (GLM52_EXECUTION_DOC.md) --------------------------------------
+# ---- recipe --------------------------------------
 NUM_EPOCHS=${NUM_EPOCHS:-10}
-BATCH_SIZE=${BATCH_SIZE:-1}                # per-rank micro-batch
+BATCH_SIZE=${BATCH_SIZE:-4}                # per-node micro-batch
 GLOBAL_BATCH=${GLOBAL_BATCH:-512}
-ACC_STEPS=${ACC_STEPS:-$(( GLOBAL_BATCH / (DATA_STREAMS * BATCH_SIZE) ))}   # A1: 512/16=32 ; A2: 512/4=128
+ACC_STEPS=${ACC_STEPS:-$(( GLOBAL_BATCH / (DATA_STREAMS * BATCH_SIZE) ))}   # 512/(4*4)=32
 LEARNING_RATE=${LEARNING_RATE:-6e-4}
 WARMUP_RATIO=${WARMUP_RATIO:-0.04}
 MAX_LEN=${MAX_LEN:-4096}
-BLOCK_SIZE=${BLOCK_SIZE:-7}                # config-owned; passed for the loss-token filter
-NUM_ANCHORS=${NUM_ANCHORS:-512}          # DeepSpec canonical (all their dspark configs use 512).
-                                         # Was 1024 (RedHat); 512 halves supervision density/step and
-                                         # is the likely reason DeepSpec is stable at unscaled 6e-4.
-MEM_FRAC=${MEM_FRAC:-0.6}                  # target ~47GB/rank at tp16 -> ample room
+BLOCK_SIZE=${BLOCK_SIZE:-7}
+NUM_ANCHORS=${NUM_ANCHORS:-512}
+MEM_FRAC=${MEM_FRAC:-0.78}
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
 MAX_RESTARTS=${MAX_RESTARTS:-0}
-SGLANG_ATTN_BACKEND=${SGLANG_ATTN_BACKEND:-dsa}   # glm_moe_dsa -> sglang "dsa" backend
+SGLANG_ATTN_BACKEND=${SGLANG_ATTN_BACKEND:-dsa}
 
 # ---- paths / models -------------------------------------------------------
 export HF_HOME=${HF_HOME:-/scratch/hf_cache}
@@ -88,10 +79,9 @@ TARGET_MODEL=${TARGET_MODEL:-zai-org/GLM-5.2-FP8}
 DRAFT_CONFIG=${DRAFT_CONFIG:-$ROOT_DIR/configs/glm-5.2-dspark.json}
 DATA_DIR=${DATA_DIR:-$HF_HOME/glm52_data}
 TRAIN_DATA=${TRAIN_DATA:-$DATA_DIR/glm52_dspark_train.jsonl}
-EVAL_DATA=${EVAL_DATA:-$DATA_DIR/glm52_dspark_eval.jsonl}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/outputs/glm5.2-dspark-4node}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-glm-5.2}
-TOTAL_SAMPLES=${TOTAL_SAMPLES:-1500000}
+TOTAL_SAMPLES=${TOTAL_SAMPLES:-0}          # 0 = use the whole mgoin corpus (~1.42M); >0 caps it
 # DeepSpec accept-length benchmark jsonl dir -> in-loop gsm8k accept-length eval
 # (built by `prepare`). Set empty to disable the periodic eval.
 EVAL_DATASETS_DIR=${EVAL_DATASETS_DIR:-$HF_HOME/glm52_evalds}
@@ -128,28 +118,53 @@ from huggingface_hub import snapshot_download
 print("  ->", snapshot_download(repo_id=sys.argv[1], max_workers=16))
 PY
   fi
-  if [ -f "$TRAIN_DATA" ] && [ -f "$EVAL_DATA" ]; then
-    log "prepare[2/3]: train/eval jsonl present, skipping"
+  if [ -f "$TRAIN_DATA" ]; then
+    log "prepare[2/3]: train jsonl present, skipping"
   else
-    log "prepare[2/3]: building mixed GLM-5.2 corpus (mgoin + codealpaca -> ${TOTAL_SAMPLES})"
+    log "prepare[2/3]: building GLM-5.2 corpus (mgoin/open-perfectblend-glm5.2-regen; cap=${TOTAL_SAMPLES}, 0=all)"
     python3 "$ROOT_DIR/scripts/prepare_glm52_dspark_data.py" \
-      --output-dir "$DATA_DIR" --total-samples "$TOTAL_SAMPLES" --eval-size "${EVAL_SIZE:-2000}"
+      --output-dir "$DATA_DIR" --total-samples "$TOTAL_SAMPLES"
   fi
-  # gsm8k accept-length benchmark (DeepSpec-exact: openai/gsm8k main/test, each
-  # question + the DeepSpec reasoning suffix). Small; built per node (node-local FS).
-  if [ -n "$EVAL_DATASETS_DIR" ] && [ ! -f "$EVAL_DATASETS_DIR/gsm8k.jsonl" ]; then
-    log "prepare[2b/3]: building DeepSpec gsm8k.jsonl -> $EVAL_DATASETS_DIR"
+  # In-loop accept-length benchmarks (DeepSpec-exact): gsm8k (math), mbpp (code),
+  # mt-bench (chat). Small; built per node (node-local FS). MUST exist on every
+  # node — a jsonl present on some replicas but not others deadlocks the in-loop
+  # eval's dp all-reduce (missing-file replicas skip the task entirely).
+  if [ -n "$EVAL_DATASETS_DIR" ]; then
     mkdir -p "$EVAL_DATASETS_DIR"
-    python3 - "$EVAL_DATASETS_DIR/gsm8k.jsonl" <<'PY'
-import sys, json
+    if [ ! -f "$EVAL_DATASETS_DIR/gsm8k.jsonl" ] || [ ! -f "$EVAL_DATASETS_DIR/mbpp.jsonl" ] \
+       || [ ! -f "$EVAL_DATASETS_DIR/mt-bench.jsonl" ]; then
+      log "prepare[2b/3]: building in-loop eval jsonls (gsm8k, mbpp, mt-bench) -> $EVAL_DATASETS_DIR"
+      python3 - "$EVAL_DATASETS_DIR" <<'PY'
+import sys, json, os
 from datasets import load_dataset
+
+out_dir = sys.argv[1]
+
+def write(name, rows):
+    path = os.path.join(out_dir, f"{name}.jsonl")
+    if os.path.exists(path):
+        print(f"  {name}: exists ({sum(1 for _ in open(path))} rows), skipping")
+        return
+    with open(path, "w") as f:
+        for turns in rows:
+            f.write(json.dumps({"turns": turns}, ensure_ascii=False) + "\n")
+    print(f"  {name}: {len(rows)} rows")
+
+# gsm8k: openai/gsm8k main/test + the DeepSpec reasoning suffix.
 SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
-ds = load_dataset("openai/gsm8k", "main", split="test")
-with open(sys.argv[1], "w") as f:
-    for row in ds:
-        f.write(json.dumps({"turns": [f"{row['question']}{SUFFIX}"]}) + "\n")
-print("  gsm8k rows:", sum(1 for _ in open(sys.argv[1])))
+gsm = load_dataset("openai/gsm8k", "main", split="test")
+write("gsm8k", [[f"{r['question']}{SUFFIX}"] for r in gsm])
+
+# mbpp: google-research-datasets/mbpp sanitized/test, bare task text (257 rows).
+mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+write("mbpp", [[r["prompt"]] for r in mbpp])
+
+# mt-bench: HuggingFaceH4/mt_bench_prompts, full turn list (80 rows; the eval
+# uses turns[0] only, but keep the file DeepSpec-converter-identical).
+mt = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+write("mt-bench", [list(r["prompt"]) for r in mt])
 PY
+    fi
   fi
   log "prepare[3/3]: warming tokenized cache"
   python3 - "$TRAIN_DATA" "$MAX_LEN" "$CHAT_TEMPLATE" "$TARGET_MODEL" "$ROOT_DIR/cache" <<'PY'
@@ -158,7 +173,10 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from specforge.data import build_eagle3_dataset
 train, max_len, tmpl, model, cache = sys.argv[1:6]
-key = hashlib.md5(f"{train}-{int(max_len)}-{tmpl}-{model}".encode()).hexdigest()
+# MUST match train_dspark.py build_dataloader's cache_key (incl. the version
+# token) or training rebuilds from scratch and this warm step is wasted.
+MASK_LOGIC_VERSION = "maskv3-glm-thinkon"
+key = hashlib.md5(f"{train}-{int(max_len)}-{tmpl}-{model}-{MASK_LOGIC_VERSION}".encode()).hexdigest()
 tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 ds = load_dataset("json", data_files=train)["train"]
 build_eagle3_dataset(dataset=ds, tokenizer=tok, chat_template=tmpl, max_length=int(max_len),
@@ -202,8 +220,6 @@ cmd_train() {
   export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
-  # deepep path (APPROACH=1): do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  # (conflicts with sglang pynccl cuMem/NVLS -> ncclCommInitRank invalid usage).
   # Rendezvous/bootstrap iface = the routable Ethernet carrying this node's
   # 10.41.20x.x address (data plane = mlx5 IB HCAs, auto-detected). Override per node.
   export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enP22p3s0np0}
@@ -225,22 +241,14 @@ cmd_train() {
   local tracker=(--report-to "$REPORT_TO")
   [ "$REPORT_TO" = "wandb" ] && tracker+=(--wandb-project "$WANDB_PROJECT" --wandb-name "$WANDB_NAME")
 
-  # Target parallelism per APPROACH (topology note above).
-  local tp_size
-  local -a PAR_FLAGS
-  if [ "$APPROACH" = "2" ]; then
-    tp_size=$NUM_GPUS                              # one tp engine per node (intra-node NVLink target)
-    PAR_FLAGS=()                                   # no DP-attention, no DeepEP -> no cross-node IB needed
-    export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}   # no IB verbs -> NCCL over TCP for cross-node draft FSDP
-    MEM_FRAC=${MEM_FRAC_A2:-0.78}                  # target ~189GB/rank at tp=NUM_GPUS -> high fraction
-  else
-    tp_size=$WORLD
-    PAR_FLAGS=(--sglang-dp-size "$WORLD" --sglang-ep-size "$WORLD"
-               --sglang-enable-dp-attention --sglang-moe-a2a-backend deepep)
-  fi
+  # Target parallelism: one tp engine per node (intra-node NVLink target), no
+  # DP-attention/DeepEP -> no cross-node IB needed. NCCL over TCP carries the
+  # cross-node draft FSDP.
+  local tp_size=$NUM_GPUS
+  export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
 
   mkdir -p "$OUTPUT_DIR"
-  log "train: APPROACH=$APPROACH node_rank=$NODE_RANK/$NNODES world=$WORLD tp=$tp_size \
+  log "train: node_rank=$NODE_RANK/$NNODES world=$WORLD tp=$tp_size \
 streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_STEPS \
 (eff. global batch=$((DATA_STREAMS * BATCH_SIZE * ACC_STEPS))) attn=$SGLANG_ATTN_BACKEND iface=$NCCL_SOCKET_IFNAME"
 
@@ -254,13 +262,12 @@ streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_S
     "$ROOT_DIR/scripts/train_dspark.py" \
     --target-model-path "$TARGET_MODEL" --trust-remote-code \
     --target-model-backend sglang --tp-size "$tp_size" \
-    "${PAR_FLAGS[@]}" \
     --sglang-attention-backend "$SGLANG_ATTN_BACKEND" \
     --sglang-mem-fraction-static "$MEM_FRAC" --sglang-context-length 8192 \
     --draft-config-path "$DRAFT_CONFIG" --block-size "$BLOCK_SIZE" \
     --attention-backend flex_attention \
     --markov-rank 256 --enable-confidence-head --confidence-head-with-markov \
-    --train-data-path "$TRAIN_DATA" --eval-data-path "$EVAL_DATA" \
+    --train-data-path "$TRAIN_DATA" \
     --output-dir "$OUTPUT_DIR" --cache-dir "$ROOT_DIR/cache" \
     --num-epochs "$NUM_EPOCHS" --batch-size "$BATCH_SIZE" --accumulation-steps "$ACC_STEPS" \
     --learning-rate "$LEARNING_RATE" --warmup-ratio "$WARMUP_RATIO" --max-grad-norm 1.0 --seed 42 \
@@ -318,11 +325,9 @@ cmd_eval() {
   local EVAL_LIMIT=${EVAL_LIMIT:-0}           # 0 -> DeepSpec per-task upstream caps (gsm8k 500, aime25 30, ...)
   local EVAL_MAX_NEW=${EVAL_MAX_NEW:-2048}    # DeepSpec protocol; thinking-ON needs room for the reasoning chain
   local EVAL_TEMP=${EVAL_TEMP:-1.0}           # DeepSpec default: stochastic rejection-sampling verify
-  # Thinking-ON by default (GLM-5.2's deployment mode + our training target).
-  # =0 for a thinking-OFF (direct-answer) sweep. MUST match the deployment mode
-  # you report; the two give very different accept lengths.
-  export SPECFORGE_EVAL_ENABLE_THINKING=${SPECFORGE_EVAL_ENABLE_THINKING:-1}
-  local EVAL_TAG=${EVAL_TAG:-$(basename "$EVAL_CKPT")_think${SPECFORGE_EVAL_ENABLE_THINKING}}
+  # Thinking-ON only (GLM-5.2's deployment mode; the eval prompt formatter has
+  # no thinking-OFF path).
+  local EVAL_TAG=${EVAL_TAG:-$(basename "$EVAL_CKPT")}
   mkdir -p "$OUTPUT_DIR/evals"
 
   if ! python3 -c "import specforge, sglang" 2>/dev/null; then
@@ -338,7 +343,7 @@ limit=$EVAL_LIMIT max_new=$EVAL_MAX_NEW temp=$EVAL_TEMP tasks=[$EVAL_TASKS]"
     --target-model-path "$TARGET_MODEL" --target-model-backend sglang --trust-remote-code \
     --tp-size "$NUM_GPUS" \
     --sglang-attention-backend "$SGLANG_ATTN_BACKEND" \
-    --sglang-mem-fraction-static "${MEM_FRAC_A2:-0.78}" --sglang-context-length 8192 \
+    --sglang-mem-fraction-static "$MEM_FRAC" --sglang-context-length 8192 \
     --draft-checkpoint "$EVAL_CKPT" --draft-attention-backend sdpa \
     --eval-datasets-dir "$EVAL_DATASETS_DIR" \
     --tasks $EVAL_TASKS \
@@ -355,5 +360,5 @@ case "${1:-}" in
   train)     cmd_train ;;
   watchdog)  cmd_watchdog ;;
   eval)      cmd_eval ;;
-  *) sed -n '2,45p' "$SCRIPT_PATH"; echo; echo "ERROR: unknown command '${1:-}'"; exit 1 ;;
+  *) sed -n '2,41p' "$SCRIPT_PATH"; echo; echo "ERROR: unknown command '${1:-}'"; exit 1 ;;
 esac

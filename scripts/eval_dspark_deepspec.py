@@ -303,24 +303,19 @@ def _encode_prompt(
     device: torch.device,
     max_prompt_len: int,
 ) -> Optional[torch.Tensor]:
-    """Format one user turn with the chat template.
+    """Format one user turn with the chat template, THINKING-ON.
 
-    Thinking mode is controlled by SPECFORGE_EVAL_ENABLE_THINKING (default 1 =
-    ON, matching GLM-5.2's default deployment): ON injects the ``Reasoning
-    Effort`` system turn and leaves ``<think>`` open so the target reasons first;
-    OFF closes the think block in the generation prompt
-    (``<|assistant|><think></think>``) so the target emits a direct answer.
-    Accept length differs markedly between the two -> report the mode that
-    matches the deployment. (Default was OFF, which understated the deployment
-    workload; the drafter is trained thinking-hybrid, primarily thinking-ON.)
+    Thinking-ON is the only supported mode (GLM-5.2's deployment default and the
+    drafter's training render): it injects the ``Reasoning Effort`` system turn
+    and leaves ``<think>`` open in the generation prompt so the target reasons
+    first. Matches GLMParser's training-side render.
     """
-    enable_thinking = os.environ.get("SPECFORGE_EVAL_ENABLE_THINKING", "1") == "1"
     messages = [{"role": "user", "content": turn}]
     try:
         enc = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            enable_thinking=enable_thinking,
+            enable_thinking=True,
             return_tensors="pt",
         )
     except TypeError:

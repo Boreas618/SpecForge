@@ -109,8 +109,8 @@ def parse_args():
         "the 'hf' backend always surfaces it.",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
-    model_group.add_argument("--block-size", type=int, default=16)
-    model_group.add_argument("--num-draft-layers", type=int, default=1)
+    model_group.add_argument("--block-size", type=int, default=7)
+    model_group.add_argument("--num-draft-layers", type=int, default=5)
     model_group.add_argument(
         "--mask-token-id",
         type=int,
@@ -207,8 +207,20 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of DeepSpec accept-length benchmark jsonl files. If set, "
-        "runs the DeepSpec-style mean-accepted-length eval (greedy) every "
-        "--eval-interval steps, reusing the loaded sglang target. Off if unset.",
+        "runs the DeepSpec-style mean-accepted-length eval (at "
+        "--eval-temperature) every --eval-interval steps, reusing the loaded "
+        "sglang target. Off if unset.",
+    )
+    dataset_group.add_argument(
+        "--eval-tasks",
+        type=str,
+        nargs="+",
+        default=["gsm8k", "mbpp", "mt-bench"],
+        help="Benchmarks for the in-loop accept-length eval (math + code + chat "
+        "trend probes), each capped at --eval-limit-per-task prompts. Must be a "
+        "subset of the DeepSpec 9-task suite with the jsonl present in "
+        "--eval-datasets-dir on EVERY node — a file present on some replicas "
+        "but not others deadlocks the eval's dp all-reduce.",
     )
     dataset_group.add_argument(
         "--eval-limit-per-task",
@@ -219,11 +231,24 @@ def parse_args():
     dataset_group.add_argument(
         "--eval-max-new-tokens",
         type=int,
-        default=1024,
+        default=2048,
         help="Max new tokens per prompt for the in-loop accept-length eval. "
-        "1024 (not 256) so a thinking-ON generation's reasoning chain is not "
-        "fully truncated; the KV-reuse verify keeps it affordable. tau_"
-        "probabilistic remains the cheap per-step proxy between decoded evals.",
+        "2048 = the standalone/final DeepSpec protocol (launcher EVAL_MAX_NEW), "
+        "so in-loop and final numbers are directly comparable and a thinking-ON "
+        "reasoning chain is not truncated; the KV-reuse verify keeps it "
+        "affordable. tau_probabilistic remains the cheap per-step proxy "
+        "between decoded evals.",
+    )
+    dataset_group.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for the in-loop accept-length eval. 1.0 = "
+        "DeepSpec's stochastic rejection-sampling default and the standalone/"
+        "final eval protocol (launcher EVAL_TEMP) — in-loop numbers then match "
+        "the final sweep in expectation (per-sample seeding keeps successive "
+        "in-loop evals comparable). 0 = greedy (deterministic, but easier than "
+        "the deployment workload and not comparable to the final eval).",
     )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
@@ -235,10 +260,10 @@ def parse_args():
     )
 
     training_group = parser.add_argument_group("training")
-    training_group.add_argument("--num-epochs", type=int, default=6)
+    training_group.add_argument("--num-epochs", type=int, default=10)
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
-    training_group.add_argument("--max-length", type=int, default=3072)
+    training_group.add_argument("--max-length", type=int, default=4096)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
@@ -389,12 +414,15 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
-    # Bump when the chat template / loss-mask logic changes so the processed-
-    # dataset cache invalidates. The base key uses only the template NAME, so a
-    # template *content* change (e.g. the GLM thinking-ON mask fix that recovered
-    # ~50% of samples) would otherwise silently reuse the stale tokenized/masked
-    # cache. v2 = GLM thinking-ON hybrid loss mask.
-    mask_logic_version = "maskv2-glm-thinkhybrid"
+    # Bump when the chat template / loss-mask logic OR the training corpus changes
+    # so the processed-dataset cache invalidates. The base key uses only the
+    # train_data_path (not its content) + template NAME, so a content change under
+    # the same path (a template mask fix, or swapping the corpus) would otherwise
+    # silently reuse the stale tokenized/masked cache. v3 = thinking-ON render
+    # (GLMParser enable_thinking=True adds the "Reasoning Effort:" system header
+    # to every training sequence, matching the deployment prompt byte-for-byte).
+    # NOTE: keep in sync with the warm-cache key in examples/run_glm5.2_dspark_4node.sh.
+    mask_logic_version = "maskv3-glm-thinkon"
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
@@ -583,9 +611,12 @@ def _maybe_run_accept_length_eval(
     args, dspark_model, draft_model, target_model, target_components, tokenizer,
     tracker, global_step,
 ):
-    """Best-effort in-loop DeepSpec accept-length eval (greedy), reusing the loaded
-    sglang target. Guarded: only runs when --eval-datasets-dir is set, and any
-    failure is swallowed so it can never kill a long training run. The standalone
+    """Best-effort in-loop DeepSpec accept-length eval, reusing the loaded sglang
+    target. Runs at --eval-temperature (default 1.0, the DeepSpec/final-eval
+    protocol) so in-loop numbers track the final sweep; run_deepspec_eval's
+    per-sample seeding keeps successive evals comparable despite the sampling.
+    Guarded: only runs when --eval-datasets-dir is set, and any failure is
+    swallowed so it can never kill a long training run. The standalone
     scripts/eval_dspark_deepspec.py is the primary/validated eval path."""
     if not args.eval_datasets_dir:
         return
@@ -605,11 +636,11 @@ def _maybe_run_accept_length_eval(
                 target_lm_head=target_components.lm_head,
                 target_embed_tokens=target_components.embed_tokens,
                 tokenizer=tokenizer,
-                tasks=None,
+                tasks=list(args.eval_tasks),
                 eval_datasets_dir=args.eval_datasets_dir,
                 limit_per_task=args.eval_limit_per_task,
                 max_new_tokens=args.eval_max_new_tokens,
-                temperature=0.0,
+                temperature=args.eval_temperature,
                 device=device,
                 verbose=(dist.get_rank() == 0),
             )
