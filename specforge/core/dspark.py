@@ -31,7 +31,6 @@ Key SpecForge differences vs TorchSpec (see port notes in the PR):
     by ``generate_dflash_data`` and fed straight to the draft as ``target_hidden``.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -82,6 +81,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 1.0,
+        objective_chunk_blocks: int = 128,
+        sanitize_nonfinite: bool = True,
+        debug_nonfinite: bool = True,
     ):
         # Reuse DFlash anchor/mask/noise machinery. loss_type="dflash" is only a
         # placeholder to satisfy the parent validator — DSpark overrides forward()
@@ -100,6 +102,18 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
+        # Objective execution knobs (were SPECFORGE_* env vars; now config).
+        # objective_chunk_blocks: slice width for the block dim so the
+        # [B, nb, bs, V] logit/prob stack peaks at ~4 GB instead of ~25 GB at
+        # nb=1024 (validated bit-equivalent). 0 selects the legacy full-
+        # materialization path (kept as the equivalence reference / fallback).
+        # sanitize_nonfinite: drop non-finite tokens from supervision so one bad
+        # FP8-target capture can't NaN-poison all ranks via the grad all-reduce.
+        # debug_nonfinite: log [NONFINITE-*] when a captured hidden / the loss is
+        # non-finite (fires only on the broken path; ~free otherwise).
+        self.objective_chunk_blocks = int(objective_chunk_blocks)
+        self.sanitize_nonfinite = bool(sanitize_nonfinite)
+        self.debug_nonfinite = bool(debug_nonfinite)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -205,7 +219,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # Non-finite inputs (captured target hidden states) poison the whole
         # objective: fc(inf) -> inf logits -> CE = +inf. Catch it at the source so
         # a bad FP8-target capture is not misdiagnosed as an objective/draft bug.
-        if os.environ.get("SPECFORGE_DEBUG_NONFINITE", "1") == "1":
+        if self.debug_nonfinite:
             for _nm, _t in (
                 ("hidden_states(context)", hidden_states),
                 ("last_hidden_states(target_final)", last_hidden_states),
@@ -218,12 +232,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
                         flush=True,
                     )
 
-        # Opt-in robustness (default OFF): under genuine DP the gradient all-reduce
+        # Robustness (on by default): under genuine DP the gradient all-reduce
         # propagates one rank's non-finite sample to all ranks, so a single bad
-        # capture over 1.5M samples can NaN the whole run. When enabled, drop
-        # non-finite tokens from supervision (loss_mask -> 0) AND zero their hidden
-        # so the inf cannot leak into good tokens through the draft's attention.
-        if os.environ.get("SPECFORGE_SANITIZE_NONFINITE", "0") == "1":
+        # capture over 1.5M samples can NaN the whole run. Drop non-finite tokens
+        # from supervision (loss_mask -> 0) AND zero their hidden so the inf cannot
+        # leak into good tokens through the draft's attention.
+        if self.sanitize_nonfinite:
             ctx_finite = torch.isfinite(hidden_states).all(dim=-1)  # [B, S]
             tgt_finite = (
                 torch.isfinite(last_hidden_states).all(dim=-1)
@@ -390,9 +404,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # Numerators + metrics. The chunked path (default) processes the block dim
         # in slices with recompute-in-backward so the [B, nb, bs, V] float tensors
         # (V=155k) never materialize at full nb — the unchunked path peaks at
-        # ~30 GB at nb=1024 and OOMs next to the sglang pool. Set
-        # SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=0 to force the legacy path.
-        chunk_blocks = int(os.environ.get("SPECFORGE_OBJECTIVE_CHUNK_BLOCKS", "128"))
+        # ~30 GB at nb=1024 and OOMs next to the sglang pool. objective_chunk_blocks=0
+        # selects the legacy full path (kept as the equivalence reference).
+        chunk_blocks = self.objective_chunk_blocks
         numerators_fn = (
             self._chunked_numerators if chunk_blocks > 0 else self._full_numerators
         )
@@ -648,7 +662,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         aligned_hidden_4d: Optional[torch.Tensor],
         chunk_blocks: int,  # unused; signature parity
     ):
-        """Legacy full-materialization path (SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=0).
+        """Legacy full-materialization path (objective_chunk_blocks=0).
 
         Materializes the full [B, nb, bs, V] logits/probs stack — needs ~30 GB
         transient at nb=1024/V=155k. Kept as a fallback and as the reference for

@@ -27,13 +27,17 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-# Per-rank compile caches + generous PG timeouts: a tp=16 sglang target load (~753B
-# GLM-5.2-FP8) and the first flex/torch.compile autotune can exceed torch's 10-min
-# default collective timeout on multi-node. Ported from train_dspark_v4.py.
-_lr = os.environ.get("LOCAL_RANK", "0")
-_cb = os.environ.get("SPECFORGE_RANK_CACHE_BASE", "/tmp/sf_caches")
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{_cb}/inductor_rank{_lr}")
-os.environ.setdefault("TRITON_CACHE_DIR", f"{_cb}/triton_rank{_lr}")
+# Widen the collective timeout for EVERY process group. The sglang target load
+# (~753B GLM-5.2-FP8) creates its own internal process groups during model
+# init, and there is no API to pass them a timeout — so we patch new_group /
+# init_process_group globally. Without this, those internal groups keep torch's
+# 10-min default and can time out mid-load on multi-node. This is the one
+# monkeypatch the training flow genuinely needs.
+PG_TIMEOUT_MINUTES = 45
+# Fail the run if fewer than this fraction of samples survive the loss-mask
+# filter — a large drop signals a chat-template/assistant-pattern mismatch
+# (zero-masked turns), not genuinely short samples.
+MIN_RETENTION = 0.9
 from datetime import timedelta as _td  # noqa: E402
 from torch.distributed import distributed_c10d as _c10d  # noqa: E402
 
@@ -41,12 +45,12 @@ _ong, _oip = _c10d.new_group, _c10d.init_process_group
 
 
 def _ng(*a, **k):
-    k["timeout"] = _td(minutes=45)
+    k.setdefault("timeout", _td(minutes=PG_TIMEOUT_MINUTES))
     return _ong(*a, **k)
 
 
 def _ip(*a, **k):
-    k["timeout"] = _td(minutes=45)
+    k.setdefault("timeout", _td(minutes=PG_TIMEOUT_MINUTES))
     return _oip(*a, **k)
 
 
@@ -241,6 +245,23 @@ def parse_args():
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
+        "--lr-scale",
+        type=float,
+        default=0.5,
+        help="Effective LR = this x the cosine schedule (schedule shape unchanged). "
+        "0.5 after the converged drafter went edge-of-stability at the schedule "
+        "peak (6e-4); 1.0 restores the DeepSpec-parity recipe. Must be identical "
+        "on all ranks (verified at startup).",
+    )
+    training_group.add_argument(
+        "--resume-lr-rewarm-steps",
+        type=int,
+        default=64,
+        help="After a reshard-safe resume (Adam moments reset), linearly re-warm "
+        "the LR over this many optimizer steps so the second moments re-estimate "
+        "before full-magnitude steps hit a converged model.",
+    )
+    training_group.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -272,8 +293,9 @@ def parse_args():
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
-    dist_group = parser.add_argument_group("distributed")
-    dist_group.add_argument("--dist-timeout", type=int, default=30)
+    # (No --dist-timeout: the process-group timeout is fixed at
+    # PG_TIMEOUT_MINUTES for both the main group and sglang's internal groups;
+    # see the monkeypatch at the top of this module.)
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -409,15 +431,13 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     # usually means the assistant_pattern did not match the rendered turns (e.g.
     # the GLM thinking-ON header regression that zero-masked ~50% of the corpus),
     # not genuinely short samples. Fail loud rather than train on half the data.
-    _min_frac = float(os.environ.get("SPECFORGE_MIN_RETENTION", "0.9"))
-    if frac < _min_frac:
+    if frac < MIN_RETENTION:
         raise RuntimeError(
             f"Only {100*frac:.1f}% of samples survived the loss-mask filter "
-            f"(< {100*_min_frac:.0f}%). This almost always means the chat "
+            f"(< {100*MIN_RETENTION:.0f}%). This almost always means the chat "
             f"template's assistant_pattern does not match the rendered assistant "
             f"turns (zero loss mask -> filtered), NOT that samples are too short. "
-            f"Inspect a rendered sample vs parser.assistant_pattern. Override with "
-            f"SPECFORGE_MIN_RETENTION=0 only if the drop is genuinely expected."
+            f"Inspect a rendered sample vs parser.assistant_pattern."
         )
 
     # Under sglang DP-attention the target runs data-parallel across ALL ranks (each
@@ -638,7 +658,7 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+    init_distributed(timeout=PG_TIMEOUT_MINUTES, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
     device = get_local_device()
@@ -652,14 +672,16 @@ def main():
     ckpt_info = (0, 0)
     if args.resume and os.path.isdir(args.output_dir):
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
     if draft_model_last_checkpoint:
         checkpoint_config_path = os.path.join(
             draft_model_last_checkpoint, "config.json"
         )
         if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
+            print_on_rank0(
+                f"Loading draft config from checkpoint: {checkpoint_config_path}"
+            )
             args.draft_config_path = checkpoint_config_path
 
     target_model, draft_model = build_models(args, device)
@@ -695,11 +717,11 @@ def main():
                 f"checkpoint key-prefix mismatch. Refusing to train a random draft."
             )
         if _missing or _unexpected:
-            print(
+            print_on_rank0(
                 f"Resume: {len(_missing)} missing / {len(_unexpected)} unexpected keys "
                 f"(loaded {_n_expected - len(_missing)}/{_n_expected})"
             )
-        print("Loaded draft model weights from checkpoint")
+        print_on_rank0("Loaded draft model weights from checkpoint")
 
         training_state_path = os.path.join(
             draft_model_last_checkpoint, "training_state.pt"
@@ -708,7 +730,7 @@ def main():
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
             )
-            print(
+            print_on_rank0(
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
             )
@@ -768,15 +790,12 @@ def main():
     )
 
     # Wrap each transformer block as its own FSDP unit (compute/comm overlap).
-    # Sharding strategy (env SPECFORGE_FSDP_STRATEGY): the ~3.8B dense draft is small,
-    # so shard_grad_op (default) keeps params resident (no fwd/bwd all-gather) while
-    # sharding grads+optimizer -> fast and fits easily beside the 47GB/rank FP8 target.
-    # full_shard / no_shard available for larger drafts or debugging.
-    _strat = {
-        "full_shard": ShardingStrategy.FULL_SHARD,
-        "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
-        "no_shard": ShardingStrategy.NO_SHARD,
-    }[os.environ.get("SPECFORGE_FSDP_STRATEGY", "shard_grad_op")]
+    # The ~3.8B dense draft is small, so SHARD_GRAD_OP keeps params resident (no
+    # fwd/bwd all-gather) while sharding grads+optimizer -> fast and fits easily
+    # beside the ~47GB/rank FP8 target. (torch.compile is intentionally not used:
+    # it recompiles on the data-dependent num_anchors shape after grads exist and
+    # crashes against FSDP's sharded-grad vs full-param sizes; eager is stable and
+    # the run is target-prefill-bound so compile would be marginal anyway.)
     fsdp_kwargs = dict(
         use_orig_params=True,
         forward_prefetch=True,
@@ -786,7 +805,7 @@ def main():
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        sharding_strategy=_strat,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
     block_names = set(getattr(draft_model, "_no_split_modules", None) or [])
     block_classes = {
@@ -805,17 +824,6 @@ def main():
     dspark_model = FSDP(dspark_model, **fsdp_kwargs)
     print_with_rank("Initialized FSDP")
 
-    # torch.compile the (FSDP-wrapped) model. Compiled AFTER FSDP is the supported
-    # ordering (FSDP comm hooks stay outermost; the draft decoder blocks + flex
-    # attention compile, while the objective's data-dependent ops — all_reduce,
-    # .item(), the vocab-softmax — graph-break cleanly). dynamic=True: draft
-    # Q/context lengths vary per batch (data-dependent num_anchors). Enabled by
-    # SPECFORGE_COMPILE_DRAFT (default OFF, incl. the GLM run script); set =1 to
-    # enable only after the FSDP-recompile crash is fixed.
-    if os.environ.get("SPECFORGE_COMPILE_DRAFT", "0") == "1":
-        dspark_model = torch.compile(dspark_model, dynamic=True)
-        print_with_rank("Applied torch.compile to dspark_model (SPECFORGE_COMPILE_DRAFT=1)")
-
     start_epoch = ckpt_info[0]
     global_step = ckpt_info[1]
 
@@ -825,20 +833,20 @@ def main():
         max_grad_norm=args.max_grad_norm,
         warmup_ratio=args.warmup_ratio,
         total_steps=total_steps,
-        offload_master=os.environ.get("SPECFORGE_OFFLOAD_MASTER", "0") == "1",
+        offload_master=False,  # ~3.8B draft fits resident; no CPU master offload.
     )
 
-    # Persistent LR scale (SPECFORGE_LR_SCALE, default 1.0 = the DeepSpec-parity
-    # schedule). The converged drafter went edge-of-stability at the schedule's
-    # peak LR twice (collapse onset within ~3 optimizer steps of running at
-    # 5.76e-4, at two different data positions; stable through the entire damped
-    # re-warm both times) -> run the same cosine shape scaled down. Applied via
-    # optimizer.step(lr_scale=...), which restores the group lr before the
-    # recurrent scheduler advances, so the schedule itself stays exact.
-    lr_scale_global = float(os.environ.get("SPECFORGE_LR_SCALE", "1.0"))
+    # Persistent LR scale (--lr-scale, default 0.5). The converged drafter went
+    # edge-of-stability at the schedule's peak LR twice (collapse onset within ~3
+    # optimizer steps of running at 6e-4, at two different data positions; stable
+    # through the entire damped re-warm both times) -> run the same cosine shape
+    # scaled down. Applied via optimizer.step(lr_scale=...), which restores the
+    # group lr before the recurrent scheduler advances, so the schedule stays exact.
+    lr_scale_global = float(args.lr_scale)
     if lr_scale_global != 1.0:
-        print_on_rank0(f"SPECFORGE_LR_SCALE={lr_scale_global}: effective LR = "
-                       f"{lr_scale_global} x schedule")
+        print_on_rank0(
+            f"--lr-scale={lr_scale_global}: effective LR = {lr_scale_global} x schedule"
+        )
     # Every rank MUST use the same scale or the sharded updates diverge — verify.
     _scale_t = torch.tensor([lr_scale_global], device=device, dtype=torch.float64)
     _scale_min, _scale_max = _scale_t.clone(), _scale_t.clone()
@@ -846,41 +854,29 @@ def main():
     dist.all_reduce(_scale_max, op=dist.ReduceOp.MAX)
     if not torch.equal(_scale_min, _scale_max):
         raise RuntimeError(
-            f"SPECFORGE_LR_SCALE differs across ranks "
+            f"--lr-scale differs across ranks "
             f"(min={_scale_min.item()}, max={_scale_max.item()}); set the same "
             f"value on every node."
         )
 
     rewarm_total = rewarm_left = 0
     if resume_state is not None:
-        if os.environ.get("SPECFORGE_RESUME_FULL_OPTIM") == "1":
-            # Full resume incl. AdamW moments. Only correct if the checkpoint's
-            # flat-param sharding matches this run's exactly; under FSDP the raw
-            # per-shard AdamW state saved by BF16Optimizer does NOT reshard onto a
-            # fresh wrap -> exp_avg vs grad size mismatch at optimizer.step().
-            # (Also: the checkpoint only holds RANK 0's optimizer shard, so this
-            # is only usable single-rank.)
-            optimizer.load_state_dict(resume_state)
-            print_on_rank0("Restored FULL optimizer + scheduler state")
-        else:
-            # Reshard-safe resume (default): restore the LR scheduler + step exactly,
-            # but reset the Adam moments. Avoids the FSDP flat-param reshard
-            # mismatch that crashes optimizer.step().
-            optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
-            # With freshly reset moments the first optimizer steps are sign-like
-            # kicks of ~lr per coordinate (m_hat/sqrt(v_hat) = +-1 at t=1): fatal
-            # for a converged model at full LR (observed: tau 4.06 -> 1.1 within
-            # ~5 opt steps of a mid-run resume). Linearly re-warm the LR over the
-            # first N optimizer steps so v_hat re-estimates on real gradients
-            # while the weights barely move. All ranks compute the identical
-            # factor, so sharded updates stay consistent.
-            rewarm_total = rewarm_left = int(
-                os.environ.get("SPECFORGE_RESUME_LR_REWARM_OPT_STEPS", "64")
-            )
-            print_on_rank0(
-                "Restored LR scheduler + step; Adam moments reset (reshard-safe); "
-                f"LR re-warm over next {rewarm_total} optimizer steps"
-            )
+        # Reshard-safe resume: restore the LR scheduler + step exactly, but reset
+        # the Adam moments (the checkpoint holds only rank-0's optimizer shard, so
+        # a full-moment resume is impossible multi-rank, and FSDP flat-param
+        # resharding would crash optimizer.step() anyway).
+        optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        # With freshly reset moments the first optimizer steps are sign-like kicks
+        # of ~lr per coordinate (m_hat/sqrt(v_hat) = +-1 at t=1): fatal for a
+        # converged model at full LR (observed: tau 4.06 -> 1.1 within ~5 opt
+        # steps of a mid-run resume). Linearly re-warm the LR over the first N
+        # optimizer steps so v_hat re-estimates on real gradients while the
+        # weights barely move. All ranks compute the identical factor.
+        rewarm_total = rewarm_left = int(args.resume_lr_rewarm_steps)
+        print_on_rank0(
+            "Restored LR scheduler + step; Adam moments reset (reshard-safe); "
+            f"LR re-warm over next {rewarm_total} optimizer steps"
+        )
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
         del resume_state
@@ -910,9 +906,13 @@ def main():
     )
     _tp_group = get_tp_group()
     _tp_size = dist.get_world_size(_tp_group) if _tp_group is not None else 1
+    # Enable whenever the topology warrants it: a tp-replicated target (no
+    # DP-attention) hands every rank in the tp group the same batch + identical
+    # hiddens, so training each rank on a distinct 1/tp slice deduplicates the
+    # draft compute at bit-identical optimization semantics. Auto-disables under
+    # Approach-1 DP-attention (each rank already has a unique shard).
     tp_scatter = (
-        os.environ.get("SPECFORGE_TP_BATCH_SCATTER", "1") == "1"
-        and not _use_dp_attention
+        not _use_dp_attention
         and _tp_size > 1
         and args.batch_size % _tp_size == 0
     )
@@ -925,9 +925,8 @@ def main():
             )
         else:
             print_on_rank0(
-                f"TP-batch scatter OFF (env or batch_size {args.batch_size} "
-                f"not divisible by tp={_tp_size}); draft compute is replicated "
-                f"{_tp_size}x per node"
+                f"TP-batch scatter OFF (batch_size {args.batch_size} not divisible "
+                f"by tp={_tp_size}); draft compute is replicated {_tp_size}x per node"
             )
 
     last_time = time.time()
