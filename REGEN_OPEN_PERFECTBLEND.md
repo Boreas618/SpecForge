@@ -468,10 +468,10 @@ Also worthwhile: 10 prompts regenerated twice at `temperature 0` must match exac
 
 ### V6 — End-to-end gate
 
-Before committing the multi-week run: mix/tokenize the corpus
+Before committing the multi-week run: normalize/tokenize the corpus
 (`scripts/prepare_glm52_dspark_data.py`-style), smoke-train the drafter a few hundred
 steps, and run the accept-length eval (`scripts/eval_dspark_deepspec.py`) **in the
-same thinking mode as the data** (`SPECFORGE_EVAL_ENABLE_THINKING=1`). Accept length
+same thinking mode as the data** (the GLM-5.2 pipeline is thinking-ON only). Accept length
 climbing off the random-draft floor is the only verification that closes the loop;
 everything above just makes sure this step can't fail for a data reason.
 
@@ -487,5 +487,5 @@ everything above just makes sure this step can't fail for a data reason.
 | P4 | resume after crash skips/dupes rows | count mismatch, duplicate ids | V1 id reconciliation + patch rerun |
 | P5 | separate `reasoning_content` fed to SpecForge GLM pipeline | reasoning silently stripped by the message sanitizer | §1 re-inline post-pass |
 | P6 | sampling params ≠ deployment (`generation_config.json`) | data subtly off-policy; V5 gap smaller than expected | §4.2 |
-| P7 | training render vs deployment prompt mismatch (e.g. GLM `Reasoning Effort:` header present at eval, absent at train under `enable_thinking=False`) | small accept-length loss at prompt starts | decide explicitly per model; prefer byte-identical renders when the template allows |
+| P7 | training render vs deployment prompt mismatch (e.g. a thinking-mode system header present at eval but absent at train because the training render passed a different `enable_thinking`) | small accept-length loss at prompt starts | render training byte-identical to deployment (the GLM-5.2 pipeline passes `enable_thinking=True` in both `GLMParser` and the eval encoder) |
 | P8 | stale processed-dataset cache after any template fix | fixed code, old masks | version the cache key (see `train_dspark.py` `maskv2-*`) |
