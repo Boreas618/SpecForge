@@ -196,8 +196,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         elif hasattr(model, "set_eagle3_layers_to_capture"):
             model.set_eagle3_layers_to_capture(layer_ids)
         inner = getattr(model, "model", None)
-        if inner is not None and hasattr(inner, "layers_to_capture"):
-            print(f"[capture] layers_to_capture={inner.layers_to_capture}")
         # Ensure the target's FINAL post-norm hidden is surfaced for DSpark's L1 /
         # confidence losses. sglang's deepseek_v2/GlmMoeDsa path CONCATENATES the k
         # captured aux layers into output.hidden_states (width k*hidden) and does NOT
@@ -355,12 +353,6 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             # the combined width is (k+1)*hidden — split context vs final here.
             hs = output.hidden_states
             k = len(self.capture_layer_ids or [])
-            if dist.get_rank() == 0 and not getattr(self, "_dbg_printed", False):
-                self._dbg_printed = True
-                print(
-                    f"[DEBUG _extend] hs_shape={tuple(hs.shape)} k={k} "
-                    f"hf_hidden={getattr(getattr(self.model_runner.model_config, 'hf_config', None), 'hidden_size', None)}"
-                )
             hidden_size = getattr(
                 getattr(self.model_runner.model_config, "hf_config", None),
                 "hidden_size",

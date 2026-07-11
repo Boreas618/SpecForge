@@ -191,50 +191,17 @@ cmd_train() {
   export PYTHONPATH=$ROOT_DIR:${PYTHONPATH:-}
   export SPECFORGE_DATA_NUM_PROC=${SPECFORGE_DATA_NUM_PROC:-64}
   export WANDB_DIR=${WANDB_DIR:-$HF_HOME}
-  # Small dense draft: params resident (shard_grad_op), no CPU master offload.
-  export SPECFORGE_FSDP_STRATEGY=${SPECFORGE_FSDP_STRATEGY:-shard_grad_op}
-  export SPECFORGE_OFFLOAD_MASTER=${SPECFORGE_OFFLOAD_MASTER:-0}
-  # torch.compile the draft: OFF by default. It CRASHES with FSDP under real
-  # varying-length data — dynamo recompiles on a new shape after grads exist and
-  # hits "assign a gradient of size [s0] to a tensor of size [s19]" (FSDP sharded
-  # grad vs full param) in Qwen3RMSNorm. Eager is validated + stable; the run is
-  # target-bound so compile is marginal. Set =1 only after the FSDP-recompile fix.
-  export SPECFORGE_COMPILE_DRAFT=${SPECFORGE_COMPILE_DRAFT:-0}
-  # Non-finite robustness: drop non-finite tokens from supervision + zero their
-  # hidden (default ON here) so one rare bad FP8-target-capture sample cannot
-  # NaN-poison all ranks via the grad all-reduce over a 10-epoch/1.5M run. The
-  # [NONFINITE-*]/[SANITIZE] diagnostics still log every occurrence + its rate.
-  # Set =0 to instead crash on a bad sample (to catch it).
-  export SPECFORGE_SANITIZE_NONFINITE=${SPECFORGE_SANITIZE_NONFINITE:-1}
-  export SPECFORGE_DEBUG_NONFINITE=${SPECFORGE_DEBUG_NONFINITE:-1}
-  # Effective LR = SCALE x the cosine schedule (schedule shape untouched).
-  # 0.5 after TWO edge-of-stability collapses of the converged drafter at the
-  # schedule's peak (5.76e-4): onset within ~3 opt steps of full LR, at two
-  # different data positions; stable through the damped re-warm both times.
-  # =1.0 restores the DeepSpec-parity 6e-4 recipe; drop to 0.25 if 0.5 collapses.
-  # MUST be identical on all nodes (the trainer cross-checks and aborts if not).
-  export SPECFORGE_LR_SCALE=${SPECFORGE_LR_SCALE:-0.5}
-  # Chunked DSpark objective: slice the block dim so the [nb,7,155k] logit/prob
-  # stack peaks at ~4 GB instead of ~25 GB (the step-46 OOM next to the sglang
-  # pool). Validated bit-equivalent to the full path. 0 = legacy full path.
-  export SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=${SPECFORGE_OBJECTIVE_CHUNK_BLOCKS:-128}
-  # Train each rank's draft on a distinct 1/tp slice of the node batch (the tp
-  # target already gives every rank identical hiddens; without scatter the
-  # draft grads are just computed tp_size times). 0 = replicate like before.
-  export SPECFORGE_TP_BATCH_SCATTER=${SPECFORGE_TP_BATCH_SCATTER:-1}
+  # Settled training behavior (FSDP shard_grad_op, compile OFF, sanitizer ON,
+  # chunked objective, TP-batch scatter) is now baked into train_dspark.py /
+  # core/dspark.py defaults — no longer env-toggled. --lr-scale and
+  # --resume-lr-rewarm-steps are real CLI args passed in the torchrun call below.
   # Kill allocator fragmentation (the OOM report showed 12.8 GB reserved-but-
   # unallocated). Safe here: the in-process sglang engine runs with
   # disable_cuda_graph=True.
   export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
   # Bound host-RAM staging on the big FP8 target load (16 ranks loading in parallel).
   export SPECFORGE_SGLANG_SERIAL_LOAD=${SPECFORGE_SGLANG_SERIAL_LOAD:-1}
-  # Draft attention: Triton flex (handles the data-dependent dual-source BlockMask).
-  # NOTE: FA4 (SPECFORGE_DRAFT_FLEX_BACKEND=fa4) is NOT usable for this mask on
-  # torch 2.11/GB300 (CuteDSL fails on captured-tensor mask_mod); leave it unset.
-  unset SPECFORGE_DRAFT_FLEX_BACKEND || true
-  # Let sglang resolve the MoE runner backend for the FP8 checkpoint (do not force).
-  unset SPECFORGE_SGLANG_MOE_RUNNER_BACKEND || true
-  # deepep path: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  # deepep path (APPROACH=1): do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   # (conflicts with sglang pynccl cuMem/NVLS -> ncclCommInitRank invalid usage).
   # Rendezvous/bootstrap iface = the routable Ethernet carrying this node's
   # 10.41.20x.x address (data plane = mlx5 IB HCAs, auto-detected). Override per node.
@@ -296,13 +263,14 @@ streams=$DATA_STREAMS master=$MASTER_ADDR:$MASTER_PORT bs=$BATCH_SIZE acc=$ACC_S
     --output-dir "$OUTPUT_DIR" --cache-dir "$ROOT_DIR/cache" \
     --num-epochs "$NUM_EPOCHS" --batch-size "$BATCH_SIZE" --accumulation-steps "$ACC_STEPS" \
     --learning-rate "$LEARNING_RATE" --warmup-ratio "$WARMUP_RATIO" --max-grad-norm 1.0 --seed 42 \
+    --lr-scale "${LR_SCALE:-0.5}" --resume-lr-rewarm-steps "${RESUME_LR_REWARM_STEPS:-64}" \
     --max-length "$MAX_LEN" --chat-template "$CHAT_TEMPLATE" \
     --num-anchors "$NUM_ANCHORS" --loss-decay-gamma 4.0 \
     --ce-loss-alpha 0.1 --l1-loss-alpha 0.9 --confidence-head-alpha 1.0 \
     --log-interval "$LOG_INTERVAL" --save-interval "$SAVE_INTERVAL" \
     --evals-per-epoch "${EVALS_PER_EPOCH:-10}" \
     --dataloader-num-workers 0 --build-dataset-num-proc "$SPECFORGE_DATA_NUM_PROC" \
-    --dist-timeout 60 "${tracker[@]}" "${EXTRA[@]}"
+    "${tracker[@]}" "${EXTRA[@]}"
 }
 
 cmd_watchdog() {
