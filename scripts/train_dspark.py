@@ -247,11 +247,12 @@ def parse_args():
     training_group.add_argument(
         "--lr-scale",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Effective LR = this x the cosine schedule (schedule shape unchanged). "
-        "0.5 after the converged drafter went edge-of-stability at the schedule "
-        "peak (6e-4); 1.0 restores the DeepSpec-parity recipe. Must be identical "
-        "on all ranks (verified at startup).",
+        "1.0 = the DeepSpec recipe (unscaled 6e-4). Set 0.5 (the earlier "
+        "stability fix) if the run collapses at the schedule peak; at num_anchors "
+        "512 the reduced supervision density makes 6e-4 far more likely to hold. "
+        "Must be identical on all ranks (verified at startup).",
     )
     training_group.add_argument(
         "--resume-lr-rewarm-steps",
