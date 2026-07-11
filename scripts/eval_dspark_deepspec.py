@@ -303,13 +303,24 @@ def _encode_prompt(
     device: torch.device,
     max_prompt_len: int,
 ) -> Optional[torch.Tensor]:
-    """Format one user turn with the chat template (enable_thinking=False)."""
+    """Format one user turn with the chat template.
+
+    Thinking mode is controlled by SPECFORGE_EVAL_ENABLE_THINKING (default 1 =
+    ON, matching GLM-5.2's default deployment): ON injects the ``Reasoning
+    Effort`` system turn and leaves ``<think>`` open so the target reasons first;
+    OFF closes the think block in the generation prompt
+    (``<|assistant|><think></think>``) so the target emits a direct answer.
+    Accept length differs markedly between the two -> report the mode that
+    matches the deployment. (Default was OFF, which understated the deployment
+    workload; the drafter is trained thinking-hybrid, primarily thinking-ON.)
+    """
+    enable_thinking = os.environ.get("SPECFORGE_EVAL_ENABLE_THINKING", "1") == "1"
     messages = [{"role": "user", "content": turn}]
     try:
         enc = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
             return_tensors="pt",
         )
     except TypeError:
@@ -753,10 +764,20 @@ def run_deepspec_eval(
                     dtype=dtype,
                 )
                 local_sample_count += 1
-                if os.environ.get("SPECFORGE_KV_DEBUG") == "1":
-                    print_on_rank0(
-                        f"[eval-sample] {task_name}#{global_idx} done: "
-                        f"out={stats['num_output']} props={len(stats['proposal_lengths'])}"
+                # Flushed per-sample progress (immune to logger block-buffering)
+                # so a long sweep is observable via tail -f. rank-0 only.
+                if os.environ.get("SPECFORGE_EVAL_PROGRESS", "1") == "1" and (
+                    (not (dist.is_available() and dist.is_initialized()))
+                    or dist.get_rank() == 0
+                ):
+                    _run = sum(
+                        1 for _ in range(replica_id, len(prompts), num_replicas)
+                    )
+                    print(
+                        f"[progress] {task_name}: replica-sample {local_sample_count}"
+                        f"/{_run}  out={stats['num_output']} "
+                        f"props={len(stats['proposal_lengths'])}",
+                        flush=True,
                     )
                 # DeepSpec allreduce_response_metrics: acceptance_length_sum,
                 # proposal_length_sum, and per-position tallies keyed on the
