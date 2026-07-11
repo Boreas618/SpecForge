@@ -215,8 +215,11 @@ def parse_args():
     dataset_group.add_argument(
         "--eval-max-new-tokens",
         type=int,
-        default=256,
-        help="Max new tokens per prompt for the in-loop accept-length eval.",
+        default=1024,
+        help="Max new tokens per prompt for the in-loop accept-length eval. "
+        "1024 (not 256) so a thinking-ON generation's reasoning chain is not "
+        "fully truncated; the KV-reuse verify keeps it affordable. tau_"
+        "probabilistic remains the cheap per-step proxy between decoded evals.",
     )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
@@ -363,11 +366,18 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
+    # Bump when the chat template / loss-mask logic changes so the processed-
+    # dataset cache invalidates. The base key uses only the template NAME, so a
+    # template *content* change (e.g. the GLM thinking-ON mask fix that recovered
+    # ~50% of samples) would otherwise silently reuse the stale tokenized/masked
+    # cache. v2 = GLM thinking-ON hybrid loss mask.
+    mask_logic_version = "maskv2-glm-thinkhybrid"
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"
+        f"{args.target_model_path}-"
+        f"{mask_logic_version}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -389,9 +399,26 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         lambda x: x["loss_mask"].sum() >= min_loss_tokens,
         num_proc=args.build_dataset_num_proc,
     )
+    retained = len(train_eagle3_dataset)
+    frac = retained / max(original_size, 1)
     print_on_rank0(
-        f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
+        f"Filtered train dataset: {original_size} -> {retained} samples "
+        f"({100*frac:.1f}% retained)"
     )
+    # Guard against a silent chat-template/loss-mask mismatch. A large drop here
+    # usually means the assistant_pattern did not match the rendered turns (e.g.
+    # the GLM thinking-ON header regression that zero-masked ~50% of the corpus),
+    # not genuinely short samples. Fail loud rather than train on half the data.
+    _min_frac = float(os.environ.get("SPECFORGE_MIN_RETENTION", "0.9"))
+    if frac < _min_frac:
+        raise RuntimeError(
+            f"Only {100*frac:.1f}% of samples survived the loss-mask filter "
+            f"(< {100*_min_frac:.0f}%). This almost always means the chat "
+            f"template's assistant_pattern does not match the rendered assistant "
+            f"turns (zero loss mask -> filtered), NOT that samples are too short. "
+            f"Inspect a rendered sample vs parser.assistant_pattern. Override with "
+            f"SPECFORGE_MIN_RETENTION=0 only if the drop is genuinely expected."
+        )
 
     # Under sglang DP-attention the target runs data-parallel across ALL ranks (each
     # rank forwards a distinct shard), so the draft must see a distinct shard per rank
