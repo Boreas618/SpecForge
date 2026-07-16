@@ -5,6 +5,7 @@ from .dflash import (
     extract_context_feature,
     sample,
 )
+from .dconv import DConvDraftModel
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
@@ -14,6 +15,7 @@ from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_
 __all__ = [
     "Eagle3DraftModel",
     "DFlashDraftModel",
+    "DConvDraftModel",
     "DominoDraftModel",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",

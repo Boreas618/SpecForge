@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""DFlash Training Script."""
+"""DFlash-family training script."""
 
 import argparse
 import functools
@@ -25,6 +25,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
+from specforge.core.dconv import OnlineDConvModel
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
@@ -32,6 +33,7 @@ from specforge.inference.target_engine.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
 )
+from specforge.modeling.draft.dconv import DConvDraftModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
@@ -55,6 +57,13 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         help="Backend for target model: 'sglang' (service) or 'hf' (local)",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
+    model_group.add_argument(
+        "--draft-method",
+        type=str,
+        default="dflash",
+        choices=["dflash", "dconv"],
+        help="Draft architecture to train. DConv uses the DFlash online pipeline.",
+    )
     model_group.add_argument("--block-size", type=int, default=16)
     model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
@@ -127,6 +136,16 @@ def _add_dflash_loss_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.5,
         help="Smoothing alpha for D-PACE objectives.",
+    )
+
+
+def _add_dconv_method_args(parser: argparse.ArgumentParser) -> None:
+    dconv_group = parser.add_argument_group("method: dconv")
+    dconv_group.add_argument(
+        "--rho-reread",
+        type=float,
+        default=0.5,
+        help="Fraction of packed blocks trained as causal pass-2 rescoring blocks.",
     )
 
 
@@ -218,6 +237,7 @@ def _build_parser(
 
     if method == "dflash":
         _add_dflash_loss_args(parser)
+        _add_dconv_method_args(parser)
     elif method == "dspark_disagg":
         _add_dspark_method_args(parser)
     else:
@@ -233,7 +253,7 @@ def _build_parser(
 
 def parse_args():
     parser = _build_parser(
-        description="Train DFlash Draft Model",
+        description="Train a DFlash or DConv draft model",
         method="dflash",
     )
     return parser.parse_args()
@@ -295,7 +315,27 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).to(device=device, dtype=torch.bfloat16)
+    if args.draft_method == "dconv":
+        architecture = (getattr(draft_config, "architectures", None) or [None])[0]
+        if architecture not in (None, "DConvDraftModel"):
+            print_on_rank0(
+                f"Warning: replacing draft architecture {architecture!r} with "
+                "'DConvDraftModel' for --draft-method dconv."
+            )
+        draft_config.architectures = ["DConvDraftModel"]
+        draft_config.dflash_config["projector_type"] = "dconv"
+        draft_config.auto_map = {
+            **(getattr(draft_config, "auto_map", None) or {}),
+            "AutoModel": "dconv.DConvDraftModel",
+        }
+        draft_cls = DConvDraftModel
+    else:
+        architecture = (getattr(draft_config, "architectures", None) or [None])[0]
+        if architecture == "DConvDraftModel":
+            raise ValueError("DConv draft config requires --draft-method dconv.")
+        draft_cls = DFlashDraftModel
+
+    draft_model = draft_cls(draft_config).to(device=device, dtype=torch.bfloat16)
 
     target_model.set_capture_layers(draft_model.target_layer_ids)
 
@@ -401,17 +441,18 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
 
             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
 
-            modeling_src = os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "specforge",
-                "modeling",
-                "draft",
-                "dflash.py",
+            draft_source_dir = os.path.join(
+                os.path.dirname(__file__), "..", "specforge", "modeling", "draft"
             )
-            modeling_dst = os.path.join(save_dir, "dflash.py")
-            if os.path.exists(modeling_src):
-                shutil.copy(modeling_src, modeling_dst)
+            modeling_files = ["dflash.py"]
+            if isinstance(draft_model, DConvDraftModel):
+                # DConv's local AutoModel module has relative imports. Copy its
+                # small dependency closure so exported checkpoints are usable.
+                modeling_files = ["dconv.py", "dflash.py", "dspark.py", "registry.py"]
+            for modeling_file in modeling_files:
+                modeling_src = os.path.join(draft_source_dir, modeling_file)
+                if os.path.exists(modeling_src):
+                    shutil.copy(modeling_src, os.path.join(save_dir, modeling_file))
 
             print_on_rank0(f"Saved checkpoint to {save_dir}")
 
@@ -427,6 +468,7 @@ def record_metrics(
     optimizer,
     train_dataloader=None,
     mode: str = "train",
+    model_metrics: Optional[dict] = None,
 ) -> None:
     logdict = {}
 
@@ -435,6 +477,8 @@ def record_metrics(
 
     logdict[f"{mode}/loss"] = loss
     logdict[f"{mode}/accuracy"] = accuracy
+    for name, value in (model_metrics or {}).items():
+        logdict[f"{mode}/{name}"] = value
 
     print_on_rank0(
         f"{mode.capitalize()} - Step {global_step} [{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], Loss: {loss:.4f}, Acc: {accuracy:.4f}"
@@ -481,7 +525,7 @@ def main():
 
     resume_state = None
     if draft_model_last_checkpoint:
-        loaded_model = DFlashDraftModel.from_pretrained(
+        loaded_model = type(draft_model).from_pretrained(
             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
         )
         draft_model.load_state_dict(loaded_model.state_dict())
@@ -533,18 +577,35 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    dflash_model = OnlineDFlashModel(
-        draft_model=draft_model,
-        target_lm_head=target_components.lm_head,
-        target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
-        attention_backend=args.attention_backend,
-        num_anchors=args.num_anchors,
-        loss_decay_gamma=args.loss_decay_gamma,
-        loss_type=args.loss_type,
-        dpace_alpha=args.dpace_alpha,
-    )
+    if isinstance(draft_model, DConvDraftModel):
+        if args.loss_type != "dflash":
+            raise ValueError(
+                "The improved-DFlash DConv stage currently supports "
+                "--loss-type dflash only."
+            )
+        dflash_model = OnlineDConvModel(
+            draft_model=draft_model,
+            target_lm_head=target_components.lm_head,
+            target_embed_tokens=target_components.embed_tokens,
+            mask_token_id=mask_token_id,
+            attention_backend=args.attention_backend,
+            num_anchors=args.num_anchors,
+            loss_decay_gamma=args.loss_decay_gamma,
+            rho_reread=args.rho_reread,
+        )
+    else:
+        dflash_model = OnlineDFlashModel(
+            draft_model=draft_model,
+            target_lm_head=target_components.lm_head,
+            target_embed_tokens=target_components.embed_tokens,
+            block_size=draft_model.block_size,
+            mask_token_id=mask_token_id,
+            attention_backend=args.attention_backend,
+            num_anchors=args.num_anchors,
+            loss_decay_gamma=args.loss_decay_gamma,
+            loss_type=args.loss_type,
+            dpace_alpha=args.dpace_alpha,
+        )
 
     # Wrap each transformer block as its own FSDP unit so that all-gather /
     # reduce-scatter overlap with compute. Without an auto_wrap_policy the
@@ -653,6 +714,13 @@ def main():
                 dist.all_reduce(acc_log)
                 loss_log = loss_log / dist.get_world_size()
                 acc_log = acc_log / dist.get_world_size()
+                metrics_log = {}
+                for name, value in _model_metrics.items():
+                    if not isinstance(value, torch.Tensor) or value.numel() != 1:
+                        continue
+                    value_log = value.detach().clone()
+                    dist.all_reduce(value_log)
+                    metrics_log[name] = (value_log / dist.get_world_size()).item()
 
                 record_metrics(
                     args,
@@ -663,6 +731,7 @@ def main():
                     optimizer,
                     train_dataloader,
                     mode="train",
+                    model_metrics=metrics_log,
                 )
 
             if dist.get_rank() == 0:
