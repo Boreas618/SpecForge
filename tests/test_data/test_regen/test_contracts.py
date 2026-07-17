@@ -158,7 +158,20 @@ print(json.dumps({name: name in sys.modules for name in ('torch', 'transformers'
     assert json.loads(result.stdout) == {"torch": False, "transformers": False}
 
 
-def test_existing_data_exports_remain_lazy_and_compatible():
-    data = importlib.import_module("specforge.data")
-    assert "build_eagle3_dataset" not in data.__dict__
-    assert "build_eagle3_dataset" in data.__all__
+def test_data_package_has_no_eager_aggregate_imports():
+    # Concrete APIs live in their owning modules; the package root must stay
+    # empty so artifact inspection and regeneration never load model or
+    # training dependencies through it.
+    script = """
+import json, sys
+import specforge.data
+import specforge.data.artifact
+print(json.dumps({name: name in sys.modules for name in ('torch', 'transformers')}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {"torch": False, "transformers": False}

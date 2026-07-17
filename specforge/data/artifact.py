@@ -106,6 +106,36 @@ def open_dataset_artifact(path_or_root: str | Path) -> DatasetArtifact:
     return DatasetArtifact(root=manifest_path.parent, manifest=manifest)
 
 
+def artifact_provenance(path_or_root: str | Path) -> dict[str, str]:
+    """Return checkpoint provenance from a manifest without payload re-hash.
+
+    The manifest's self-digest is still verified, so a tampered manifest is
+    refused; full per-file verification happens where the data is read
+    (:func:`open_dataset_artifact`).
+    """
+
+    import json
+
+    from .regen.contracts import canonical_digest as _digest
+
+    path = Path(path_or_root).expanduser().resolve()
+    manifest_path = path / "manifest.json" if path.is_dir() else path
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"cannot read artifact manifest: {exc}") from exc
+    if manifest.get("state") != "FINALIZED":
+        raise ArtifactError(f"{manifest_path}: artifact is not FINALIZED")
+    body = dict(manifest)
+    recorded = body.pop("artifact_digest", None)
+    if recorded != _digest(body):
+        raise ArtifactError(f"{manifest_path}: artifact digest mismatch")
+    return {
+        "dataset_artifact_digest": str(recorded),
+        "dataset_recipe_digest": str(manifest["recipe_digest"]),
+    }
+
+
 def preprocessing_cache_key(
     artifact_digest: str, semantic_fields: Mapping[str, Any]
 ) -> str:
