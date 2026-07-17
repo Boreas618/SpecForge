@@ -293,11 +293,8 @@ def _close_configured_logger(logger) -> None:
         close()
 
 
-def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
-    import json
-
-    identity = {
-        "path": path or cfg.data.prompts_path or cfg.data.train_data_path,
+def _prompt_semantic_identity(cfg: Config) -> Dict[str, Any]:
+    return {
         "max_length": cfg.data.max_length,
         "chat_template": cfg.data.chat_template,
         "is_preformatted": cfg.data.is_preformatted,
@@ -311,7 +308,68 @@ def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
         "strategy": cfg.training.strategy,
         "input_modality": cfg.model.input_modality,
     }
+
+
+def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
+    import json
+
+    identity = {
+        "path": path or cfg.data.prompts_path or cfg.data.train_data_path,
+        **_prompt_semantic_identity(cfg),
+    }
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def dataset_artifact_checkpoint_extra(cfg: Config) -> Dict[str, Any]:
+    """Dataset provenance persisted into (and verified against) checkpoints.
+
+    A run resumed against a different artifact, or one fed unverified
+    regenerated JSONL, must fail the resume contract rather than silently
+    train on different data.
+    """
+
+    if cfg.data.dataset_artifact:
+        from specforge.data.artifact import artifact_provenance
+
+        return dict(artifact_provenance(cfg.data.dataset_artifact))
+    if cfg.data.allow_unverified_regenerated_jsonl:
+        return {"unverified_regenerated_jsonl": True}
+    return {}
+
+
+def _materialize_artifact_view(cfg: Config) -> tuple[str, str]:
+    """Verify the artifact and return (text view path, preprocessing key).
+
+    The derived plain-conversation view is content-addressed by the artifact
+    digest under the run cache, so re-materialization is an idempotent write
+    and any artifact byte change invalidates both the view and the processed
+    prompt cache.
+    """
+
+    import json
+
+    from specforge.data.artifact import open_dataset_artifact, preprocessing_cache_key
+
+    artifact = open_dataset_artifact(cfg.data.dataset_artifact)
+    cache_key = preprocessing_cache_key(
+        artifact.digest, _prompt_semantic_identity(cfg)
+    )
+    view_dir = os.path.join(cfg.data.cache_dir, "dataset_artifacts")
+    os.makedirs(view_dir, exist_ok=True)
+    view_path = os.path.join(view_dir, f"{artifact.digest}.jsonl")
+    if not os.path.exists(view_path):
+        temporary = f"{view_path}.{os.getpid()}.tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                for record in artifact.iter_text_records():
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, view_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return view_path, cache_key
 
 
 def _prepare_prompts(
@@ -336,16 +394,34 @@ def _prepare_prompts(
         )
     from specforge.data.prompt_builder import prepare_prompt_tasks
 
-    configured_path = cfg.data.prompts_path or cfg.data.train_data_path
-    source_path = path or configured_path
-    if not source_path:
-        raise ValueError("prompt preparation requires a non-empty data path")
-    if cache_key is None:
-        cache_key = (
-            cfg.data.cache_key
-            if path is None and cfg.data.cache_key is not None
-            else _prompt_cache_key(cfg, path=source_path)
-        )
+    if path is None and cfg.data.dataset_artifact:
+        # The artifact is verified (manifest self-digest and every payload
+        # file digest) before any row is read; its digest replaces the path
+        # in cache identity so the processed prompt cache is content-addressed.
+        source_path, artifact_cache_key = _materialize_artifact_view(cfg)
+        if cache_key is None:
+            cache_key = artifact_cache_key
+    else:
+        if path is None and cfg.data.allow_unverified_regenerated_jsonl:
+            import warnings
+
+            warnings.warn(
+                "data.allow_unverified_regenerated_jsonl: training on "
+                "model-regenerated rows that never passed artifact "
+                "finalization; this migration escape hatch is recorded in "
+                "checkpoints and will be removed",
+                stacklevel=2,
+            )
+        configured_path = cfg.data.prompts_path or cfg.data.train_data_path
+        source_path = path or configured_path
+        if not source_path:
+            raise ValueError("prompt preparation requires a non-empty data path")
+        if cache_key is None:
+            cache_key = (
+                cfg.data.cache_key
+                if path is None and cfg.data.cache_key is not None
+                else _prompt_cache_key(cfg, path=source_path)
+            )
     min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
     return prepare_prompt_tasks(
         source_path,

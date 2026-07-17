@@ -210,7 +210,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="target model path supplying a frozen embedding for HF export",
     )
     export.add_argument("--embedding-key", default="model.embed_tokens.weight")
+    data = sub.add_parser("data", help="data preparation and regeneration")
+    data_commands = data.add_subparsers(dest="data_command", required=True)
+    regen = data_commands.add_parser(
+        "regen", help="regenerate decoded text and structured trajectories"
+    )
+    from specforge.data.regen.cli import configure_regen_parser
+
+    configure_regen_parser(regen)
     args = parser.parse_args(argv)
+
+    if args.command == "data" and args.data_command == "regen":
+        import sys
+
+        from specforge.data.regen.cli import run_regen_command
+        from specforge.data.regen.errors import RegenerationError
+
+        try:
+            return run_regen_command(args)
+        except RegenerationError as exc:
+            print(f"specforge data regen: {exc}", file=sys.stderr)
+            return 2
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)

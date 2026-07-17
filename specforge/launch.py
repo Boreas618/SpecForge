@@ -1343,6 +1343,7 @@ def build_disagg_online_consumer(
     resume_from: Optional[str] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    checkpoint_extra: Optional[dict] = None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1626,6 +1627,7 @@ def build_disagg_online_consumer(
             collate_fn=_streaming_collate(algorithm, modality, collate_fn),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
+            checkpoint_extra=checkpoint_extra,
             max_checkpoints=max_checkpoints,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,

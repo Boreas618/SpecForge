@@ -106,6 +106,10 @@ class DataConfig(StrictConfigModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
+    #: online mode — finalized regeneration ``DatasetArtifact`` manifest or
+    #: artifact root. The manifest and file digests are verified before use
+    #: and the artifact digest enters cache identity and checkpoints.
+    dataset_artifact: str = ""
     #: Reserved migration field. Online evaluation is unsupported; keep empty.
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
@@ -121,6 +125,10 @@ class DataConfig(StrictConfigModel):
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     max_prompts: Optional[int] = Field(default=None, ge=0)
+    #: Migration-only escape hatch: acknowledge that train_data_path points at
+    #: model-regenerated rows that never passed artifact finalization. Noisy
+    #: in logs and recorded in checkpoints; removed after one release.
+    allow_unverified_regenerated_jsonl: bool = False
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
@@ -128,12 +136,25 @@ class DataConfig(StrictConfigModel):
             bool(self.train_data_path),
             bool(self.prompts_path),
             bool(self.hidden_states_path),
+            bool(self.dataset_artifact),
         ]
         if sum(sources) != 1:
             raise ValueError(
                 "set exactly one of data.train_data_path (raw online data), "
-                "data.prompts_path (pre-tokenized online data), or "
-                "data.hidden_states_path (offline features)"
+                "data.prompts_path (pre-tokenized online data), "
+                "data.hidden_states_path (offline features), or "
+                "data.dataset_artifact (finalized regeneration artifact)"
+            )
+        if self.dataset_artifact and "chat_template" not in self.model_fields_set:
+            raise ValueError(
+                "data.chat_template must be set explicitly with "
+                "data.dataset_artifact; the artifact's rows must render with "
+                "the template that matches its generator"
+            )
+        if self.allow_unverified_regenerated_jsonl and not self.train_data_path:
+            raise ValueError(
+                "data.allow_unverified_regenerated_jsonl applies only to "
+                "data.train_data_path"
             )
         return self
 

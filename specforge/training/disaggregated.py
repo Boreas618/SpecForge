@@ -515,6 +515,7 @@ def _build_online(
         _dataloader_num_workers,
         _load_input_tools,
         _profiling_options,
+        dataset_artifact_checkpoint_extra as _dataset_checkpoint_extra,
     )
 
     modality = cfg.model.input_modality
@@ -754,6 +755,7 @@ def _build_online(
         resume_from=cfg.training.resume_from,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        checkpoint_extra=_dataset_checkpoint_extra(cfg) or None,
     )
 
     return TrainingRun(trainer=trainer)

@@ -161,6 +161,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL sent to the online capture producer. |
 | `data.prompts_path` | `""` | Pre-tokenized online JSONL with `input_ids` and `loss_mask`. |
 | `data.hidden_states_path` | `""` | Directory of precomputed offline feature `.ckpt` files. Selecting it makes the run offline. |
+| `data.dataset_artifact` | `""` | Finalized regeneration `DatasetArtifact` manifest or artifact root. The manifest and every payload digest are verified before use; the artifact digest enters the prompt cache identity and checkpoint provenance. Requires an explicit `data.chat_template`. |
 | `data.eval_data_path` | `""` | Reserved migration field. Online evaluation is unsupported; leave it empty. |
 | `data.eval_hidden_states_path` | `""` | Offline evaluation features; configure them together with a positive `training.eval_interval`. |
 | `data.max_length` | `2048` | Maximum token length used by preparation, capture, and training. |
@@ -172,6 +173,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
+| `data.allow_unverified_regenerated_jsonl` | `false` | Migration-only acknowledgement that `data.train_data_path` holds model-regenerated rows that never passed artifact finalization. Noisy in logs and recorded in checkpoints; removed after one release. |
 
 Offline evaluation uses `eval_hidden_states_path`; configure it together with
 `training.eval_interval`. Online evaluation is unsupported, and setting
