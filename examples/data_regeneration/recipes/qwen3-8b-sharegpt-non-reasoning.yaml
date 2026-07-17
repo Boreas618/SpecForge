@@ -1,0 +1,46 @@
+# Non-reasoning ShareGPT replay against Qwen3-8B.
+#
+# Model choices live here; inference endpoints are runtime-only:
+#   specforge data regen run --config <this file> \
+#     --endpoint teacher=http://localhost:30000
+version: 1
+seed: 20260717
+
+sources:
+  sharegpt:
+    adapter: jsonl
+    record_adapter: sharegpt
+    config: {path: ./cache/dataset/sharegpt_train.jsonl}
+    selection: {mode: all}
+
+generators:
+  teacher:
+    backend: openai_chat
+    model: Qwen/Qwen3-8B
+    # Pin an immutable revision before producing a production artifact.
+    revision: main
+    codec: structured_chat
+    sampling:
+      temperature: 0
+      max_tokens: 4096
+      reasoning: disabled
+      extra:
+        chat_template_kwargs: {enable_thinking: false}
+    config:
+      control_tokens: ["<think>", "</think>"]
+
+workflow:
+  - id: regenerate
+    operation: replay_assistants
+    generator: teacher
+    tool_policy: reject
+
+validation:
+  profiles: [baseline]
+  max_unresolved_error_rate: 0.005
+  max_policy_reject_rate: 0.05
+
+output:
+  uri: ./cache/dataset/sharegpt-regen-qwen3-8b-non-reasoning
+  format: jsonl
+  shards: 8

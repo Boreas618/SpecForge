@@ -1,7 +1,17 @@
-"""Validate regenerated ShareGPT JSONL before training."""
+"""DEPRECATED wrapper validating regenerated JSONL via the baseline profile.
+
+Finalized regeneration artifacts are validated with
+``specforge data regen validate --artifact <dir>``; that path enforces the
+full publication gates (coverage, thresholds, tampering). This wrapper keeps
+the historical loose-JSONL checks for one release by routing each row through
+the pipeline's record normalization and the registered ``baseline`` validator,
+plus the legacy expectations (single success status, terminal assistant turn,
+reasoning-mode contract, think-marker defense).
+"""
 
 import argparse
 import json
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +21,17 @@ try:
     from scripts.conversation_validation import has_think_marker, validate_conversation
 except ModuleNotFoundError:
     from conversation_validation import has_think_marker, validate_conversation
+
+try:
+    import specforge  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+DEPRECATION_NOTICE = (
+    "scripts/validate_regenerated_data.py is a deprecated compatibility "
+    "wrapper and will be removed after one release. Finalized artifacts are "
+    "validated with `specforge data regen validate --artifact <dir>`."
+)
 
 
 @dataclass(frozen=True)
@@ -22,7 +43,10 @@ class ValidationSummary:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate regenerated ShareGPT JSONL before training."
+        description=(
+            "DEPRECATED wrapper: validate regenerated ShareGPT JSONL through "
+            "the baseline regeneration profile."
+        )
     )
     parser.add_argument("--data-path", required=True, type=Path)
     reasoning_group = parser.add_mutually_exclusive_group()
@@ -58,6 +82,36 @@ def iter_jsonl(path: Path) -> Iterable[tuple[int, Dict[str, Any]]]:
             yield line_number, row
 
 
+def _baseline_findings(row: Dict[str, Any]) -> list:
+    """Run the row through the pipeline contracts it must satisfy to train."""
+
+    from specforge.data.regen.contracts import (
+        RecordEnvelope,
+        RecordKey,
+        canonical_digest,
+    )
+    from specforge.data.regen.errors import ContractError
+    from specforge.data.regen.records.messages import (
+        normalize_sharegpt_record,
+        preserved_digest,
+    )
+    from specforge.data.regen.validators.baseline import create_baseline_validator
+
+    try:
+        normalized = normalize_sharegpt_record(row, source_name="legacy", position=0)
+    except ContractError as exc:
+        raise ValueError(str(exc)) from None
+    envelope = RecordEnvelope(
+        key=RecordKey(source="legacy", source_id=normalized.source_id),
+        input_position=0,
+        payload=normalized.payload,
+        source_fingerprint="sha256:unverified-legacy-jsonl",
+        source_payload_digest=canonical_digest(normalized.payload),
+        source_preserved_digest=preserved_digest(normalized.payload),
+    )
+    return create_baseline_validator().validate(envelope)
+
+
 def validate_row(
     row: Dict[str, Any],
     *,
@@ -66,6 +120,7 @@ def validate_row(
     strict_think_markers: bool,
 ) -> int:
     """Validate one generated training row and return its assistant count."""
+
     row_id = row.get("id")
     if not isinstance(row_id, str) or not row_id.strip():
         raise ValueError("id must be a non-empty string")
@@ -76,6 +131,11 @@ def validate_row(
     conversation_error = validate_conversation(messages)
     if conversation_error is not None:
         raise ValueError(conversation_error)
+
+    findings = _baseline_findings(row)
+    if findings:
+        first = findings[0]
+        raise ValueError(f"{first.code}: {first.message}")
 
     assistant_count = 0
     for index, message in enumerate(messages):
@@ -166,6 +226,7 @@ def validate_dataset(
 
 def main() -> None:
     args = parse_args()
+    print(DEPRECATION_NOTICE, file=sys.stderr)
     try:
         summary = validate_dataset(
             args.data_path,

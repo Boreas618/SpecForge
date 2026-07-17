@@ -1,0 +1,49 @@
+version: 1
+seed: 20260717
+
+sources:
+  first:
+    adapter: jsonl
+    record_adapter: openai_messages
+    config: {path: ./first.jsonl}
+    selection: {mode: all}
+  second:
+    adapter: jsonl
+    record_adapter: sharegpt
+    config: {path: ./second.jsonl}
+    selection: {mode: sample, sample: 100, seed: 12}
+
+generators:
+  teacher:
+    backend: fake
+    model: deterministic-test-teacher
+    codec: structured_chat
+    sampling: {temperature: 0, max_tokens: 256, reasoning: required}
+    config:
+      content_template: "answer:{prompt}:{variant}"
+      reasoning_template: "reason:{prompt}:{ordinal}"
+  judge:
+    backend: fake
+    model: deterministic-test-judge
+    codec: structured_chat
+    sampling: {temperature: 0, max_tokens: 16}
+    config: {content_template: "0"}
+
+workflow:
+  - id: candidates
+    operation: replay_assistants
+    generator: teacher
+    candidates: 2
+  - id: choose
+    operation: select_candidate
+    generator: judge
+
+validation:
+  profiles: [baseline]
+  max_unresolved_error_rate: 0
+  max_policy_reject_rate: 0
+
+output:
+  uri: ./artifact
+  format: jsonl
+  shards: 4
