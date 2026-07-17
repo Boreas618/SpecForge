@@ -1,0 +1,47 @@
+# Reasoning-trajectory ShareGPT replay against Qwen3.6-27B.
+#
+# Every regenerated assistant turn must carry non-empty reasoning_content;
+# request history strips earlier-turn reasoning to match the serving template
+# while the finalized artifact keeps the complete captured trajectory.
+version: 1
+seed: 20260717
+
+sources:
+  sharegpt:
+    adapter: jsonl
+    record_adapter: sharegpt
+    config: {path: ./cache/dataset/sharegpt_train.jsonl}
+    selection: {mode: all}
+
+generators:
+  teacher:
+    backend: openai_chat
+    model: Qwen/Qwen3.6-27B
+    # Pin an immutable revision before producing a production artifact.
+    revision: main
+    codec: structured_chat
+    sampling:
+      temperature: 0
+      max_tokens: 32768
+      reasoning: required
+      extra:
+        chat_template_kwargs: {enable_thinking: true}
+    config:
+      control_tokens: ["<think>", "</think>"]
+      history_reasoning: strip
+
+workflow:
+  - id: regenerate
+    operation: replay_assistants
+    generator: teacher
+    tool_policy: reject
+
+validation:
+  profiles: [baseline]
+  max_unresolved_error_rate: 0.005
+  max_policy_reject_rate: 0.05
+
+output:
+  uri: ./cache/dataset/sharegpt-regen-qwen3.6-27b-reasoning
+  format: jsonl
+  shards: 8

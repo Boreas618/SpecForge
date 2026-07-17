@@ -38,7 +38,6 @@ specforge = "specforge.cli:main"
 exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
-data = ["openai"]
 dev = [
     "pre-commit",
 ]
