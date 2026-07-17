@@ -54,8 +54,8 @@ This is, in the predecessor's own terms, pulling **feature #32 ("Mooncake stream
 forward from Phase 7 to now** because the requirement demands it — and implementing it with the
 already-built `runtime/` work, behind the clean domain interfaces.
 
-**Two scope decisions that bound this plan** (consolidating with the online-disaggregation
-roadmap, #618):
+**Three cross-cutting decisions that bound this plan** (consolidating with the
+online-disaggregation roadmap, #618, and the data-regeneration prototype):
 
 1. **Frozen target — no weight sync.** "Train-with-decode" means a *frozen* target streams
    hidden states; the draft is never in the generation loop. Weight sync / hot draft-update /
@@ -64,10 +64,17 @@ roadmap, #618):
 2. **Ray is an open decision, not a non-goal.** It is a *candidate* for the O2 scale-out
    orchestrator (multi-node N-producer/M-trainer) — likely necessary, but not committed. Until the
    decision gate fires we keep the home-grown metadata-only control plane and add nothing.
+3. **Regenerated corpora are verified artifacts, not loose JSONL.** The behavioral guarantees in
+   `_temp/regen` become a first-class, model/dataset-independent runtime under
+   `specforge/data/regen/`. Any first-party model-derived corpus is finalized and validated as a
+   content-addressed `DatasetArtifact` before the normal training path consumes it. Regeneration
+   captures decoded text messages and structured reasoning/tool trajectories only; hidden states,
+   logits, embeddings, and all other tensor features are categorically outside this subsystem.
+   Detailed phases: [data-regeneration.md](docs/roadmap/data-regeneration.md).
 
 **Per-phase target/implementation detail lives in [`docs/roadmap/`](docs/roadmap/)** (domain,
-online-disaggregation [folds in #618], eval & breadth); this document is the architecture; the
-roadmap is the build order.
+online-disaggregation [folds in #618], eval & breadth, data regeneration); this document is the
+architecture; the roadmap is the build order.
 
 ---
 
@@ -177,6 +184,11 @@ specforge/
 │   └── data_plane/                  # FeatureStore (Local/SharedDir/Mooncake), FeatureDataLoader,
 │                                    #   SampleRefQueue, StreamingRefChannel, offline/disagg readers
 │
+├── data/
+│   ├── regen/                       # text/reasoning/tool trajectories only: typed recipes,
+│   │                                #   adapters, exact resume/rebuild, validation, artifacts
+│   └── parse.py  template.py  preprocessing.py  cache.py  # train-facing data preparation
+│
 ├── inference/                       # TOP-LEVEL — the single home for all rollout/capture execution
 │   ├── rollout_worker.py            #   (from runtime/inference/rollout_worker.py)
 │   ├── capture.py                   #   CaptureConfig (from runtime/inference/capture.py)
@@ -271,6 +283,22 @@ from the in-source `NOTE`s. Each lands behind the canonical spine without re-plu
 ### G5 — Run surface (predecessor Phase 3)
 - Pydantic `config/` + `specforge` CLI; `export/to_sglang` (+ the documented MLA weight-name
   map) and `export/to_hf` with vocab pruning.
+
+### G6 — Verified data regeneration (cross-cutting infrastructure)
+
+- Promote `_temp/regen` by extracting its deterministic seeds, shard identities, exact resume,
+  raw-token exact-rebuild, source-preservation, and renderer/loss-mask gates into a generic
+  `specforge/data/regen` pipeline. Source schema, operation, generation backend, conversation
+  codec, tool policy, validator, executor, and artifact store are orthogonal registered axes;
+  core code never switches on a dataset or model family.
+- The payload contract is decoded text messages plus structured reasoning/tool trajectories and
+  provenance. It never requests, captures, stores, or transports hidden states, logits,
+  embeddings, or tensor features; any existing mixed path is split during migration.
+- A typed recipe may name multiple sources, generators, and ordered stages. Finalization produces
+  a content-addressed `DatasetArtifact`; its digest flows into text-preprocessing cache keys,
+  training metadata, evaluation, and checkpoints.
+- Detailed extraction, compatibility, scaling, and breadth phases (R0–R5):
+  [`docs/roadmap/data-regeneration.md`](docs/roadmap/data-regeneration.md).
 
 ---
 
@@ -407,6 +435,10 @@ also folds in the former online-disaggregation roadmap (#618).
   sync.** Detail: [`docs/roadmap/online-disaggregation.md`](docs/roadmap/online-disaggregation.md).
 - **Eval track (parallel) — E1** acceptance-length eval harness → **E2** algorithm breadth (new
   algo = a `StrategySpec` + loss). Detail: [`docs/roadmap/eval-and-breadth.md`](docs/roadmap/eval-and-breadth.md).
+- **Data-regeneration track (parallel; G6) — R0** contract/publication audit → **R1** generic
+  kernel + artifact lifecycle → **R2** adapter parity → **R3** CLI/composition/dataset boundary
+  → **R4** scale/hardening and **R5** trajectory/operation breadth. Detail:
+  [`docs/roadmap/data-regeneration.md`](docs/roadmap/data-regeneration.md).
 
 Doc debt to fix alongside Phase B: revise the predecessor's "No Mooncake / HTTP is sufficient"
 statements (now §5/§6) so the code and the plan stop contradicting each other.
@@ -419,6 +451,9 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
   staleness gate. `draft_weight_version` is provenance metadata only.
 - **No two-stack fork for colocated.** One canonical data path; colocated is the spine with the
   control plane as a no-op, not a parallel implementation.
+- **No tensors in regeneration.** `specforge/data/regen` owns decoded messages and structured
+  reasoning/tool trajectories. It does not call feature-capture APIs or use hidden-state runtime
+  contracts for storage, scheduling, validation, or output.
 - **No vLLM target backend** (possible via `TargetEngine`, not prioritized).
 - **No multi-engine load balancing / multi-job inference-pool sharing** for now — gated behind
   ≥5 concurrent jobs sharing one target.
@@ -441,6 +476,7 @@ statements (now §5/§6) so the code and the plan stop contradicting each other.
 | Managers (D) | resume reproduces the no-resume loss curve; one all-reduce per optimizer step; best-checkpoint tracked. |
 | Drafts/MLA (E) | MLA Eagle3 trains + loads in SGLang; new draft arch = one `@register_draft` file. |
 | Online (O1.3) | a live **frozen-target** SGLang server feeds training with zero precomputed features; loss/eval matches the offline baseline on the same prompts+seed. (Scale-out O2 / Ray = open.) |
+| Data regeneration (R0–R3) | model-derived text/reasoning trajectories are produced through registered sources/operations/backends/codecs, finalized as a validated content-addressed artifact, and rejected before consumption if partial, incompatible, or tampered; no hidden states enter the subsystem. |
 
 ---
 

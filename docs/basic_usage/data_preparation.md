@@ -27,7 +27,16 @@ You can view the full list of pre-supported datasets using `python scripts/prepa
 
 ## ↩️ Regenerate Datasets
 
-When training speculative decoding draft models for a specific target model, instead of using the original dataset, we can regenerate the assistant responses using the target model to better align the draft model with the target model's output distribution. This will improve the acceptance rate of the draft model and the overall performance of the speculative decoding. According to the [EAGLE1 paper](https://arxiv.org/pdf/2401.15077), the EAGLE method is not very sensitive to the dataset quality, which means the performance is still good even if you use the original dataset. However, if you are looking for optimal performance in the production environment, it is recommended to regenerate the dataset using the target model.
+> **Scope:** Dataset regeneration captures serialized conversation semantics only:
+> message roles and text, visible assistant content, structured `reasoning_content`,
+> tool calls/results, and trajectory provenance. It does not request, capture, store,
+> or transport model hidden states, logits, embeddings, KV caches, or other tensor
+> features. Any hidden-state preparation used by an offline training workflow is a
+> separately invoked workflow outside regeneration. The canonical regenerated
+> dataset retains every emitted text, reasoning, and tool block; field-reduced
+> training views are separate derived datasets.
+
+When training speculative decoding draft models for a specific target model, instead of using the original dataset, we can regenerate the assistant message text and reasoning trajectories using the target model to better align the draft model with the target model's output distribution. Later turns are conditioned on the newly regenerated textual history. This can improve the acceptance rate of the draft model and the overall performance of speculative decoding. According to the [EAGLE1 paper](https://arxiv.org/pdf/2401.15077), the EAGLE method is not very sensitive to dataset quality, which means performance can still be good with the original dataset. For optimal production alignment, however, regenerating the textual dataset with the target model is recommended.
 
 We can follow the following steps to regenerate the dataset. In the example below, we will use `meta-llama/Llama-3.1-8B-Instruct` as an example, you can replace it with your own target model.
 
@@ -42,7 +51,28 @@ python3 -m sglang.launch_server \
     --port 30000
 ```
 
-2. Regenerate the dataset using the `regenerate_train_data.py` script.
+2. Author a regeneration recipe (see `examples/data_regeneration/recipes/`
+   for complete templates) and run the artifact lifecycle:
+
+```shell
+specforge data regen run --config recipe.yaml \
+    --endpoint teacher=http://localhost:30000
+specforge data regen validate --artifact ./artifacts/sharegpt-regen
+specforge data regen finalize --artifact ./artifacts/sharegpt-regen
+```
+
+The finalized artifact directory is the training input
+(`data.dataset_artifact: <artifact>/manifest.json`). For reasoning models,
+set the generator's `sampling.reasoning: required` to capture
+`reasoning_content` for every regenerated turn, or `reasoning: disabled`
+(with `chat_template_kwargs.enable_thinking: false`) for thinking-off
+regeneration; both contracts are enforced during generation and validation.
+
+The legacy `scripts/regenerate_train_data.py` entry point remains available
+for one release as a deprecated compatibility wrapper. It accepts the
+historical flags, executes through the same pipeline, produces the same
+finalized artifact under `<output>.regen-artifact/`, and additionally derives
+the historical `<output>.jsonl` / `_error.jsonl` / `_skipped.jsonl` files:
 
 ```shell
 python scripts/regenerate_train_data.py \
@@ -55,7 +85,8 @@ python scripts/regenerate_train_data.py \
     --output-file-path ./cache/dataset/sharegpt_train_regen.jsonl
 ```
 
-For reasoning models, add `--reasoning save` to store `reasoning_content` in the regenerated dataset. To use a reasoning model with thinking disabled, add `--reasoning disable`, which forwards `chat_template_kwargs.enable_thinking=false` to the SGLang server and does not save `reasoning_content`.
+With the wrapper, `--reasoning save` stores `reasoning_content` and
+`--reasoning disable` disables thinking, as before.
 
 ### Multi-turn structured reasoning
 
@@ -73,9 +104,13 @@ python scripts/explode_generation_events.py \
 
 Each event ends at its current assistant target and preserves that turn's
 `reasoning_content` and visible `content`. Historical assistant messages keep
-only visible `content`; their hidden reasoning is removed from the event
+only visible `content`; their earlier `reasoning_content` is removed from the event
 context. Train the exploded output with the entry point's
 `train_only_last_turn` option enabled.
+
+This explosion is an optional derived training view. It does not alter the regeneration
+contract: the validated conversation-level artifact retains every captured assistant
+message and its complete reasoning trajectory.
 
 The converter accepts only successful rows with non-empty IDs, message content,
 and assistant `reasoning_content`. Invalid input is written to a skipped JSONL;
@@ -86,9 +121,12 @@ For maximum performance, we recommend to scale the number of GPUs to regenerate 
 
 ### Qwen ShareGPT recipes
 
-The Qwen recipe wraps regeneration, complete-row accounting, and output
-validation. It expects one or more SGLang servers to already be running; it does
-not launch or stop the servers itself.
+The Qwen model and sampling choices live in recipe files under
+`examples/data_regeneration/recipes/`; the entry scripts select a recipe,
+point it at the input dataset, and drive the
+`specforge data regen run → validate → finalize` lifecycle with complete-row
+accounting. They expect one or more SGLang servers to already be running; they
+do not launch or stop the servers themselves.
 
 For Qwen3-8B non-reasoning regeneration, start a target server in one terminal:
 
@@ -108,14 +146,15 @@ the SpecForge repository root:
 ```bash
 MODEL_PROFILE=qwen3-8b \
 INPUT_FILE=./cache/dataset/sharegpt_train.jsonl \
-OUTPUT_FILE=./cache/dataset/sharegpt_train_regen_qwen3_8b_temperature0_non_reasoning.jsonl \
+ARTIFACT_DIR=./cache/dataset/sharegpt-regen-qwen3-8b-non-reasoning \
 SERVER_ADDRESSES="localhost:30000" \
 bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 ```
 
-This profile sets temperature to zero, disables thinking through
-`chat_template_kwargs.enable_thinking=false`, and rejects non-empty structured
-reasoning in successful rows.
+This profile (`recipes/qwen3-8b-sharegpt-non-reasoning.yaml`) sets temperature
+to zero, disables thinking through `chat_template_kwargs.enable_thinking=false`,
+and rejects non-empty structured reasoning and leaked think markers in
+successful rows.
 
 For Qwen3.6-27B structured-reasoning regeneration, start SGLang with the Qwen3
 reasoning parser so the OpenAI-compatible response includes
@@ -137,41 +176,37 @@ After `curl --fail http://127.0.0.1:30000/health` succeeds, run:
 ```bash
 MODEL_PROFILE=qwen3.6-27b \
 INPUT_FILE=./cache/dataset/sharegpt_train.jsonl \
-OUTPUT_FILE=./cache/dataset/sharegpt_train_regen_qwen3.6-27b_temperature0_reasoning.jsonl \
+ARTIFACT_DIR=./cache/dataset/sharegpt-regen-qwen3.6-27b-reasoning \
 SERVER_ADDRESSES="localhost:30000" \
 bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 ```
 
 The default maximum completion lengths are 4096 tokens for Qwen3-8B and 32768
-tokens for Qwen3.6-27B. The server context length must accommodate both the
-rendered prompt and `MAX_TOKENS`; override `MAX_TOKENS` when using a shorter
-server context.
+tokens for Qwen3.6-27B; the server context length must accommodate both the
+rendered prompt and the recipe's `max_tokens`. Adjust these by editing the
+recipe (or passing a dotted override such as
+`generators.teacher.sampling.max_tokens=8192` to `specforge data regen run`).
 
 `INPUT_FILE` may point to another dataset without changing the recipe as long
 as it is JSONL in the conversation format documented below, with a non-empty
 string `id` and alternating `user`/`assistant` messages. Always choose a fresh
-`OUTPUT_FILE`: the recipe deliberately refuses to overwrite or resume an
-existing run.
+`ARTIFACT_DIR`: the entry script deliberately refuses to reuse a finalized
+artifact.
 
-For an output such as `dataset_regen.jsonl`, the recipe produces:
-
-- `dataset_regen.jsonl`: successful regenerated training rows;
-- `dataset_regen_error.jsonl`: request or generation errors;
-- `dataset_regen_skipped.jsonl`: schema-invalid inputs and outputs excluded by the
-  selected reasoning contract.
-
-The run passes accounting only when
-`success + error + skipped == input`. It prints the success fraction without a
-fixed minimum threshold, then strictly validates every successful row,
-including its conversation structure, reasoning contract, and absence of raw
-`<think>` markers.
+The run produces a finalized artifact directory containing the regenerated
+data shards, a rejects ledger with stable failure categories, the attempt
+history, validation reports, and a content-addressed `manifest.json`. The
+accounting step passes only when
+`success + error + skipped == input`; it prints the success fraction without a
+fixed minimum threshold. Row structure, the reasoning contract, and raw
+`<think>` marker defense are enforced by the recipe's validation profile
+before the manifest can be published.
 
 To distribute regeneration across independently launched servers, provide all
 addresses as a space-separated list, for example:
 
 ```bash
 SERVER_ADDRESSES="localhost:30000 localhost:30010" \
-CONCURRENCY=64 \
 bash examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 ```
 
@@ -219,7 +254,9 @@ torchrun --standalone --nproc_per_node 8 \
     # ... other arguments
 ```
 
-For offline training, you can also use `--is-preformatted` when generating hidden states:
+For offline training, you can also use `--is-preformatted` in the separate hidden-state
+preparation step shown below. This command consumes an already prepared or regenerated
+textual JSONL dataset; it is not part of dataset regeneration.
 
 ```bash
 # Generate hidden states from pre-formatted data
@@ -233,7 +270,9 @@ torchrun --nproc_per_node=8 \
     --max-length 2048
 ```
 
-Once you have the `jsonl` file ready, you can proceed with online training or generate hidden states for offline training. See the Training guide for more details.
+Regeneration itself ends once the validated textual `jsonl` artifact is ready. You can then
+use that artifact for online training or pass it to the separate offline preparation flow.
+See the Training guide for more details.
 
 
 ## ➕ Handling Multiple Datasets

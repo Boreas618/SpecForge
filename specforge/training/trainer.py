@@ -59,6 +59,7 @@ class Trainer:
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
         max_checkpoints: int = 0,
+        checkpoint_extra: Optional[dict] = None,
     ):
         # durable_ack off (local_colocated): no durable ack transaction — the
         # loader releases each feature as it consumes it — so the offline enqueue
@@ -117,6 +118,13 @@ class Trainer:
                     f"model: {loaded}/{len(saved_weights)} keys loaded, "
                     f"unexpected={sorted(load_result.unexpected_keys)}"
                 )
+            for key, current in (checkpoint_extra or {}).items():
+                persisted = state.get(key)
+                if persisted is not None and persisted != current:
+                    raise ValueError(
+                        f"checkpoint {resume_from} was written with "
+                        f"{key}={persisted!r} but this run has {key}={current!r}"
+                    )
             # Mid-epoch position persists in SAMPLES (batch-size independent);
             # only an offline (refs) stream can be repositioned, and a batch-size
             # drift that does not divide the count fails fast (a silent mis-seek
@@ -182,6 +190,7 @@ class Trainer:
             checkpoint_extra={
                 "dataset_size": dataset_size,
                 "accumulation_steps": accumulation_steps,
+                **(checkpoint_extra or {}),
             },
             start_step=resume["global_step"] if resume else 0,
             start_epoch=resume["epoch"] if resume else 0,

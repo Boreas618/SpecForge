@@ -68,6 +68,7 @@ def _assemble_trainer(
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    checkpoint_extra: Optional[dict] = None,
 ):
     """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
     assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
@@ -103,6 +104,7 @@ def _assemble_trainer(
         durable_ack=durable_ack,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
+        checkpoint_extra=checkpoint_extra,
     )
     return trainer.controller, trainer.loader
 
@@ -364,6 +366,7 @@ def build_offline_runtime(
     metadata_db_path: Optional[str] = None,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    checkpoint_extra: Optional[dict] = None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -414,6 +417,7 @@ def build_offline_runtime(
         durable_ack=durable_ack,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
+        checkpoint_extra=checkpoint_extra,
     )
 
 
@@ -520,6 +524,7 @@ def build_online_runtime(
     log_interval: int = 50,
     resume_from: Optional[str] = None,
     max_checkpoints: int = 0,
+    checkpoint_extra: Optional[dict] = None,
 ):
     """Assemble the colocated online dataflow; return
     ``(trainer, loader, workers, controller, drive_rollout)``.
@@ -579,6 +584,7 @@ def build_online_runtime(
         durable_ack=durable_ack,
         resume_from=resume_from,
         max_checkpoints=max_checkpoints,
+        checkpoint_extra=checkpoint_extra,
     )
 
     def drive_rollout(max_rounds: int = 100_000) -> int:

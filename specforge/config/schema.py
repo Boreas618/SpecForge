@@ -44,15 +44,32 @@ class DataConfig(BaseModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
+    #: finalized model-derived text/trajectory artifact manifest or root.
+    dataset_artifact: str = ""
+    #: required semantic renderer selection for dataset_artifact preprocessing.
+    chat_template: str = ""
+    preprocessing_cache_dir: str = "./cache/regenerated_text"
+    preprocessing_num_proc: int = 1
+    #: migration-only escape hatch; normal consumers still require a manifest.
+    allow_unverified_regenerated_jsonl: bool = False
     max_length: int = 2048
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
-        if bool(self.prompts_path) == bool(self.hidden_states_path):
+        sources = [
+            bool(self.prompts_path),
+            bool(self.hidden_states_path),
+            bool(self.dataset_artifact),
+        ]
+        if sum(sources) != 1:
             raise ValueError(
-                "set exactly one of data.prompts_path (online) or "
-                "data.hidden_states_path (offline)"
+                "set exactly one of data.prompts_path (online), "
+                "data.hidden_states_path (offline), or data.dataset_artifact"
             )
+        if self.dataset_artifact and not self.chat_template:
+            raise ValueError("data.chat_template is required with dataset_artifact")
+        if self.preprocessing_num_proc <= 0:
+            raise ValueError("data.preprocessing_num_proc must be positive")
         return self
 
 

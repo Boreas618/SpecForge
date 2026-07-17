@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from typing import List, Optional
 
 from specforge.config import Config, load_config
@@ -49,6 +50,67 @@ def _load_prompts(path: str) -> List[dict]:
                 }
             )
     return prompts
+
+
+def _load_artifact_prompts(cfg: Config) -> tuple[List[dict], dict]:
+    """Verify, content-address, and tokenize a finalized text artifact."""
+
+    from datasets import Dataset
+    from transformers import AutoTokenizer
+
+    from specforge.data import (
+        build_eagle3_dataset,
+        open_dataset_artifact,
+        preprocessing_cache_key,
+    )
+
+    artifact = open_dataset_artifact(cfg.data.dataset_artifact)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model.target_model_path,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    tokenizer_identity = {
+        "name_or_path": getattr(tokenizer, "name_or_path", cfg.model.target_model_path),
+        "commit": getattr(tokenizer, "_commit_hash", None),
+    }
+    semantic_fields = {
+        "max_length": cfg.data.max_length,
+        "chat_template": cfg.data.chat_template,
+        "tokenizer": tokenizer_identity,
+        "shuffle_seed": cfg.training.seed,
+    }
+    cache_key = preprocessing_cache_key(artifact.digest, semantic_fields)
+    dataset = Dataset.from_generator(artifact.iter_text_records)
+    processed = build_eagle3_dataset(
+        dataset,
+        tokenizer,
+        chat_template=cfg.data.chat_template,
+        max_length=cfg.data.max_length,
+        shuffle_seed=cfg.training.seed,
+        num_proc=cfg.data.preprocessing_num_proc,
+        cache_dir=cfg.data.preprocessing_cache_dir,
+        cache_key=cache_key,
+    )
+    prompts = []
+    for index, row in enumerate(processed):
+        input_ids = row["input_ids"]
+        loss_mask = row["loss_mask"]
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if hasattr(loss_mask, "tolist"):
+            loss_mask = loss_mask.tolist()
+        while input_ids and isinstance(input_ids[0], list):
+            input_ids = input_ids[0]
+        while loss_mask and isinstance(loss_mask[0], list):
+            loss_mask = loss_mask[0]
+        prompts.append(
+            {
+                "task_id": f"artifact-{artifact.digest[:16]}-{index:012d}",
+                "payload": {"input_ids": input_ids, "loss_mask": loss_mask},
+                "metadata": {"dataset_artifact_digest": artifact.digest},
+            }
+        )
+    return prompts, artifact.provenance(preprocessing_cache_key=cache_key)
 
 
 def _build_eagle3_model(cfg: Config):
@@ -124,6 +186,12 @@ def build_from_config(cfg: Config):
         logger=lambda metrics, step: print(f"step {step}: {metrics}", flush=True),
         resume_from=t.resume_from,
     )
+    checkpoint_extra = None
+    artifact_prompts = None
+    if cfg.data.dataset_artifact:
+        artifact_prompts, checkpoint_extra = _load_artifact_prompts(cfg)
+        common["checkpoint_extra"] = checkpoint_extra
+
     eagle3_model = _build_eagle3_model(cfg)
 
     if cfg.mode == "offline":
@@ -168,7 +236,11 @@ def build_from_config(cfg: Config):
     )
     trainer, loader, workers, controller, drive_rollout = build_online_runtime(
         target_model=target,
-        prompts=_load_prompts(cfg.data.prompts_path),
+        prompts=(
+            artifact_prompts
+            if artifact_prompts is not None
+            else _load_prompts(cfg.data.prompts_path)
+        ),
         eagle3_model=eagle3_model,
         target_hidden_size=int(target_config.hidden_size),
         target_vocab_size=int(target_config.vocab_size),
@@ -212,11 +284,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         nargs="*",
         help="dotted overrides, e.g. training.learning_rate=1e-4",
     )
+    data = sub.add_parser("data", help="data preparation and regeneration")
+    data_commands = data.add_subparsers(dest="data_command", required=True)
+    regen = data_commands.add_parser(
+        "regen", help="regenerate decoded text and structured trajectories"
+    )
+    from specforge.data.regen.cli import configure_regen_parser
+
+    configure_regen_parser(regen)
     args = parser.parse_args(argv)
 
     if args.command == "train":
         cfg = load_config(args.config, args.overrides)
         _train(cfg)
+    elif args.command == "data" and args.data_command == "regen":
+        from specforge.data.regen.cli import run_regen_command
+        from specforge.data.regen.errors import RegenerationError
+
+        try:
+            return run_regen_command(args)
+        except RegenerationError as exc:
+            print(f"specforge data regen: {exc}", file=sys.stderr)
+            return 2
     return 0
 
 
