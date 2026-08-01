@@ -360,3 +360,73 @@ TEMPLATE_REGISTRY.register(
         enable_thinking=True,
     ),
 )
+
+
+# NDA/Inkling. Typed-token framing with no HF Jinja template of its own; the
+# text-equivalent template is PACKAGED with SpecForge
+# (specforge/data/templates/nda_inkling_thinking.jinja — byte-identical to
+# regen/inkling_chat_template.jinja, which regen/specforge_bridge.py installs
+# on the validation side) and is auto-installed on the tokenizer by
+# build_eagle3_dataset / install_packaged_chat_template below. An
+# assistant sampling turn is a run of <|message_model|>-headed blocks
+# (thinking / text / invoke_tool_json); the "inkling" assistant pattern ends
+# supervision at the next <|message_user|>/<|message_tool|>/<|message_system|>
+# header, all three of which are ignore_token'd out of the loss.
+TEMPLATE_REGISTRY.register(
+    name="nda-inkling-thinking",
+    template=ChatTemplate(
+        assistant_header="<|message_model|>",
+        user_header="<|message_user|>",
+        system_prompt=None,
+        end_of_turn_token="<|message_user|>",
+        parser_type="thinking",
+        assistant_pattern_type="inkling",
+        enable_thinking=True,
+        ignore_token=["<|message_user|>", "<|message_tool|>", "<|message_system|>"],
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Packaged Jinja chat templates.
+#
+# Some targets ship NO tokenizer chat template (NDA/Inkling renders server-side
+# via render_inkling_messages). For those, the byte-exact text-equivalent Jinja
+# is packaged here and must be installed on the tokenizer BEFORE
+# apply_chat_template is used (rendering + loss-mask offsets both depend on it).
+# ---------------------------------------------------------------------------
+import hashlib as _hashlib
+import os as _os
+
+PACKAGED_CHAT_TEMPLATE_FILES = {
+    "nda-inkling-thinking": _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "templates",
+        "nda_inkling_thinking.jinja",
+    ),
+}
+
+
+def install_packaged_chat_template(tokenizer, chat_template_name: str) -> bool:
+    """Install the packaged Jinja for ``chat_template_name`` onto the tokenizer.
+
+    Returns True when a packaged template exists and was installed (always
+    overwrites — the packaged file is the source of truth for these targets);
+    False when the name has no packaged template (tokenizer's own is used).
+    """
+    path = PACKAGED_CHAT_TEMPLATE_FILES.get(chat_template_name)
+    if path is None:
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        tokenizer.chat_template = f.read().strip()
+    return True
+
+
+def packaged_chat_template_hash(chat_template_name: str):
+    """Short content hash of the packaged Jinja (None if not packaged). Include
+    this in dataset cache keys so a template edit invalidates tokenized caches."""
+    path = PACKAGED_CHAT_TEMPLATE_FILES.get(chat_template_name)
+    if path is None:
+        return None
+    with open(path, "rb") as f:
+        return _hashlib.sha256(f.read()).hexdigest()[:12]

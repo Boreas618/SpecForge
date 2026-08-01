@@ -1,0 +1,28 @@
+{%- if tools -%}
+<|message_system|>tool_declare<|content_xml|>[
+{%- for t in tools -%}
+{{- {'description': (t.get('function', {}).get('description') or ''), 'name': t.get('function', {})['name'], 'parameters': (t.get('function', {}).get('parameters') or {}), 'type': t.get('type', 'function')} | tojson(sort_keys=True, separators=(',', ':')) -}}
+{%- if not loop.last -%},{%- endif -%}
+{%- endfor -%}]<|end_message|>
+{%- endif -%}
+<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>
+{%- for message in messages -%}
+{%- if message['role'] == 'system' and message.get('content') -%}
+<|message_system|><|content_text|>{{ message['content'] }}<|end_message|>
+{%- elif message['role'] == 'user' and message.get('content') -%}
+<|message_user|><|content_text|>{{ message['content'] }}<|end_message|>
+{%- elif message['role'] == 'tool' -%}
+<|message_tool|>{{ message.get('name') or '' }}<|content_text|>{{ message.get('content') or '' }}<|end_message|>
+{%- elif message['role'] == 'assistant' -%}
+{%- if message.get('reasoning_content') -%}
+<|message_model|><|content_thinking|>{{ message['reasoning_content'] }}<|end_message|>
+{%- endif -%}
+{%- if message.get('content') -%}
+<|message_model|><|content_text|>{{ message['content'] }}<|end_message|>
+{%- endif -%}
+{%- for tc in message.get('tool_calls') or [] -%}
+<|message_model|><|content_invoke_tool_json|>{"name":{{ tc.get('function', {})['name'] | tojson }},"args":{{ (tc.get('function', {}).get('arguments') or {}) | tojson(sort_keys=True, separators=(',', ':')) }}}<|end_message|>
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|message_model|>{%- endif -%}
