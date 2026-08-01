@@ -17,11 +17,14 @@ code, so it is imported by training entry points, not at package load.
 from __future__ import annotations
 
 import abc
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 from specforge.runtime.contracts import TrainBatch
 
@@ -454,7 +457,21 @@ class DFlashTrainStrategy(DraftTrainStrategy):
 
 
 class DSparkTrainStrategy(DraftTrainStrategy):
-    """DSpark strategy over DFlash with target hidden-state supervision."""
+    """DSpark strategy over DFlash with target hidden-state supervision.
+
+    When the trainer runs with a co-located TP-replicated target (no
+    DP-attention), every rank in the TP group receives the same batch and
+    identical captured hiddens, so without intervention each rank runs the
+    draft forward/backward on the full node batch -- ``tp_size`` copies of the
+    same compute. ``tp_batch_scatter`` trains each TP rank on a distinct
+    ``1/tp_size`` slice instead. This is bit-identical optimization: the DSpark
+    loss pools its denominator with a world all-reduce and multiplies by
+    ``world_size``, so per-rank-unique slices produce exactly the same pooled
+    global mean as replicated batches, at ``tp_size`` x less draft compute.
+
+    (This is DSpark-specific: the DFlash loss normalizes locally, so slicing
+    would change its gradient semantics.)
+    """
 
     name = "dspark"
     required_features = {
@@ -464,8 +481,61 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         "target_last_hidden_states",
     }
 
-    def __init__(self, dspark_model: nn.Module) -> None:
+    def __init__(
+        self, dspark_model: nn.Module, *, tp_batch_scatter: bool = True
+    ) -> None:
         self.dspark_model = dspark_model
+        self.tp_batch_scatter = bool(tp_batch_scatter)
+        self._tp_scatter_logged = False
+
+    def _tp_slice(
+        self, tensors: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Slice the replicated batch to this rank's 1/tp_size share."""
+        if not self.tp_batch_scatter:
+            return tensors
+
+        import torch.distributed as dist
+
+        from specforge.distributed import get_tp_group
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return tensors
+        tp_group = get_tp_group()
+        if tp_group is None:
+            return tensors
+        tp_size = dist.get_world_size(tp_group)
+        if tp_size <= 1:
+            return tensors
+
+        bsz = tensors["input_ids"].shape[0]
+        if bsz % tp_size != 0:
+            if not self._tp_scatter_logged:
+                logger.warning(
+                    "TP-batch scatter disabled: batch_size %d is not divisible "
+                    "by tp_size %d; draft compute is replicated %dx per node. "
+                    "Note that reducing batch size below tp_size makes memory "
+                    "worse, not better, for exactly this reason.",
+                    bsz,
+                    tp_size,
+                    tp_size,
+                )
+                self._tp_scatter_logged = True
+            return tensors
+
+        if not self._tp_scatter_logged:
+            logger.info(
+                "TP-batch scatter ON: node batch %d -> %d sample(s)/rank "
+                "across tp=%d",
+                bsz,
+                bsz // tp_size,
+                tp_size,
+            )
+            self._tp_scatter_logged = True
+
+        tp_rank = dist.get_rank(tp_group)
+        n = bsz // tp_size
+        return {k: v[tp_rank * n : (tp_rank + 1) * n] for k, v in tensors.items()}
 
     def trainable_module(self) -> nn.Module:
         return self.dspark_model
@@ -478,6 +548,17 @@ class DSparkTrainStrategy(DraftTrainStrategy):
     ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
+        t = self._tp_slice(
+            {
+                k: t[k]
+                for k in (
+                    "input_ids",
+                    "hidden_states",
+                    "loss_mask",
+                    "target_last_hidden_states",
+                )
+            }
+        )
         device = self._device()
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device),

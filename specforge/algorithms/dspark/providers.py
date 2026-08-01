@@ -5,7 +5,6 @@ from __future__ import annotations
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
-    empty_options,
     no_missing_checkpoint_keys,
 )
 from specforge.algorithms.common.dflash_family_data import (
@@ -42,7 +41,22 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     del target_head
     from specforge.training.strategies.base import DSparkTrainStrategy
 
-    return DSparkTrainStrategy(wrapped_model)
+    return DSparkTrainStrategy(
+        wrapped_model,
+        tp_batch_scatter=bool(_options.get("tp_batch_scatter", True)),
+    )
+
+
+def step_options(config):
+    # A TP-replicated co-located target hands every rank in the TP group the
+    # same batch, so each rank trains its own 1/tp_size slice (bit-identical
+    # under DSpark's world-pooled loss). Under DP-attention every rank already
+    # holds a unique shard, so slicing again would silently drop data.
+    return {
+        "tp_batch_scatter": not bool(
+            getattr(config.model, "sglang_enable_dp_attention", False)
+        )
+    }
 
 
 def resume_contract(_config, draft_model, training_model):
@@ -147,7 +161,7 @@ def algorithm_providers() -> AlgorithmProviders:
         algorithm_name=ALGORITHM_NAME,
         step=StepProvider(
             build=build_step,
-            options=empty_options,
+            options=step_options,
             resume_contract=resume_contract,
             allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
             uses_external_target_head=False,
