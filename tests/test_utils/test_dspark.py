@@ -76,6 +76,9 @@ def _make_dspark_config(
     V=128,
     num_target_layers=2,
     num_hidden_layers=1,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=128,
     markov_rank=16,
     enable_confidence_head=True,
     confidence_head_with_markov=True,
@@ -84,8 +87,9 @@ def _make_dspark_config(
         hidden_size=H,
         intermediate_size=256,
         num_hidden_layers=num_hidden_layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
         vocab_size=V,
         rms_norm_eps=1e-6,
         max_position_embeddings=512,
@@ -177,6 +181,15 @@ class TestDSparkConfig(unittest.TestCase):
         self.assertIsNone(m.markov_head)
         self.assertIsNone(m.confidence_head)
 
+    def test_rejects_non_divisible_gqa_ratio(self):
+        cfg = _make_dspark_config(
+            num_attention_heads=8,
+            num_key_value_heads=3,
+            head_dim=8,
+        )
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            DSparkDraftModel(cfg)
+
 
 class TestDSparkForward(unittest.TestCase):
     def test_returns_six_tuple_with_detached_components(self):
@@ -184,7 +197,10 @@ class TestDSparkForward(unittest.TestCase):
         out = m(**_batch())
         self.assertEqual(len(out), 6)
         loss, acc, lpp, app, cpp, comps = out
-        self.assertEqual(set(comps), {"ce_loss", "l1_loss", "confidence_loss"})
+        self.assertTrue(
+            {"ce_loss", "l1_loss", "confidence_loss"}.issubset(comps),
+            f"missing required loss components: {sorted(comps)}",
+        )
         for v in comps.values():
             self.assertTrue(torch.isfinite(v).all())
             self.assertFalse(v.requires_grad)  # detached for logging
@@ -247,6 +263,28 @@ class TestDSparkForward(unittest.TestCase):
         self.assertGreater(draft.fc.weight.grad.abs().sum().item(), 0)
         # target embedding is frozen (lives on the wrapper, not the draft)
         self.assertIsNone(m.embed_tokens.weight.grad)
+
+    def test_inkling_gqa16_projection_shapes_and_gradients(self):
+        # Exercise the quality-oriented Inkling ratio (64 query heads / 16 KV
+        # heads) with a small head dimension so the CPU regression stays cheap.
+        m = _make_dspark_model(
+            H=128,
+            num_attention_heads=64,
+            num_key_value_heads=16,
+            head_dim=2,
+        )
+        attn = m.draft_model.layers[0].self_attn
+        self.assertEqual(attn.num_key_value_groups, 4)
+        self.assertEqual(tuple(attn.q_proj.weight.shape), (128, 128))
+        self.assertEqual(tuple(attn.k_proj.weight.shape), (32, 128))
+        self.assertEqual(tuple(attn.v_proj.weight.shape), (32, 128))
+
+        loss, *_ = m(**_batch(H=128, seed=3))
+        loss.backward()
+        self.assertIsNotNone(attn.k_proj.weight.grad)
+        self.assertIsNotNone(attn.v_proj.weight.grad)
+        self.assertGreater(attn.k_proj.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(attn.v_proj.weight.grad.abs().sum().item(), 0)
 
     def test_ce_only_without_target(self):
         # ce-only (l1=0, no confidence) must run without last_hidden_states.

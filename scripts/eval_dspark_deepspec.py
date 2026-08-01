@@ -303,19 +303,24 @@ def _encode_prompt(
     device: torch.device,
     max_prompt_len: int,
 ) -> Optional[torch.Tensor]:
-    """Format one user turn with the chat template, THINKING-ON.
+    """Format one user turn with the chat template.
 
-    Thinking-ON is the only supported mode (GLM-5.2's deployment default and the
-    drafter's training render): it injects the ``Reasoning Effort`` system turn
-    and leaves ``<think>`` open in the generation prompt so the target reasons
-    first. Matches GLMParser's training-side render.
+    Thinking mode is controlled by SPECFORGE_EVAL_ENABLE_THINKING (default 1 =
+    ON, matching GLM-5.2's default deployment): ON injects the ``Reasoning
+    Effort`` system turn and leaves ``<think>`` open so the target reasons first;
+    OFF closes the think block in the generation prompt
+    (``<|assistant|><think></think>``) so the target emits a direct answer.
+    Accept length differs markedly between the two -> report the mode that
+    matches the deployment. (Default was OFF, which understated the deployment
+    workload; the drafter is trained thinking-hybrid, primarily thinking-ON.)
     """
+    enable_thinking = os.environ.get("SPECFORGE_EVAL_ENABLE_THINKING", "1") == "1"
     messages = [{"role": "user", "content": turn}]
     try:
         enc = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            enable_thinking=True,
+            enable_thinking=enable_thinking,
             return_tensors="pt",
         )
     except TypeError:
@@ -683,6 +688,22 @@ def run_deepspec_eval(
 
     if stop_token_ids is None:
         stop_token_ids = _resolve_stop_token_ids(tokenizer)
+    if stop_token_ids is None:
+        # Targets whose tokenizer defines NO eos (NDA/Inkling) pin the stop set
+        # in the draft config instead (eos_token_id list — e.g. [200006, 200000,
+        # 200002, 200003]; the mid-turn <|message_model|>=200001 must never be
+        # in it, the model legitimately emits it between thinking/text blocks).
+        config_eos = getattr(draft_model.config, "eos_token_id", None)
+        if isinstance(config_eos, int):
+            stop_token_ids = [config_eos]
+        elif config_eos:
+            stop_token_ids = [int(t) for t in config_eos]
+    if not stop_token_ids:
+        raise ValueError(
+            "no stop token ids: the tokenizer defines no eos and the draft "
+            "config carries no eos_token_id — pass stop_token_ids explicitly "
+            "(generation would only ever end at max_new_tokens)."
+        )
 
     # Ensure the sglang target captures the draft's context layers.
     target_model.set_capture_layers(list(draft_model.target_layer_ids))
@@ -708,10 +729,17 @@ def run_deepspec_eval(
 
     dtype = next(draft_model.parameters()).dtype
 
-    # Default to the single gsm8k task (e.g. the trainer's periodic eval passes
-    # tasks=None); any of the DeepSpec 9 may be requested explicitly.
+    # tasks=None (the trainer's periodic eval): discover every prebuilt
+    # <task>.jsonl in eval_datasets_dir, so adding an in-loop eval task is
+    # just dropping a file there (prepare builds gsm8k + aime25). Falls back
+    # to gsm8k when the dir has nothing.
     if not tasks:
-        tasks = ["gsm8k"]
+        found = sorted(
+            os.path.splitext(f)[0]
+            for f in os.listdir(eval_datasets_dir)
+            if f.endswith(".jsonl")
+        ) if eval_datasets_dir and os.path.isdir(eval_datasets_dir) else []
+        tasks = found or ["gsm8k"]
     normalized_tasks = _normalize_tasks(tasks, limit_per_task)
 
     per_dataset: Dict[str, Dict[str, object]] = {}
@@ -1077,6 +1105,23 @@ def parse_args() -> argparse.Namespace:
         help="Skip prompts longer than this many tokens.",
     )
     eval_group.add_argument("--seed", type=int, default=980406)
+    eval_group.add_argument(
+        "--stop-token-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit stop token ids. Default resolution: tokenizer eos, then "
+        "the draft config's eos_token_id list (required for NDA/Inkling, whose "
+        "tokenizer defines no eos).",
+    )
+    eval_group.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help="SpecForge chat-template name whose PACKAGED Jinja should be "
+        "installed on the tokenizer before prompt rendering (e.g. "
+        "nda-inkling-thinking). Unset: use the tokenizer's own template.",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument(
@@ -1151,6 +1196,14 @@ def build_everything(args: argparse.Namespace, device: torch.device):
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
+    if args.chat_template:
+        from specforge.data.template import install_packaged_chat_template
+
+        if install_packaged_chat_template(tokenizer, args.chat_template):
+            print_on_rank0(
+                f"[deepspec-eval] installed packaged chat template "
+                f"'{args.chat_template}' on the tokenizer"
+            )
 
     return target_model, draft_model, target_components, tokenizer
 
@@ -1184,6 +1237,7 @@ def main() -> None:
         temperature=args.temperature,
         max_prompt_len=args.max_prompt_len,
         seed=args.seed,
+        stop_token_ids=args.stop_token_ids,
         device=device,
         output_json=args.output_json,
         verbose=True,

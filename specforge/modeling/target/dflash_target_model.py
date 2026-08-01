@@ -43,6 +43,10 @@ class DFlashTargetOutput:
     # last_hidden_states cover only positions [prefix_len, seq_len) — the prefix
     # was served from KV cache and not recomputed. None outside sessions.
     prefix_len: Optional[int] = None
+    # Engine-computed next-token logits for each request's LAST position
+    # [batch, vocab]. Diagnostic passthrough: lets probes compare the engine's
+    # own head against an externally loaded frozen head on the same hidden.
+    next_token_logits: Optional[torch.Tensor] = None
 
 
 class DFlashTargetModel(ABC):
@@ -101,8 +105,20 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
         _valid = {f.name for f in _dc.fields(ServerArgs)}
         _dropped = sorted(k for k in kwargs if k not in _valid)
+        # Silently dropping an EXPLICITLY-SET engine flag is how a required
+        # backend knob (e.g. Inkling's mamba/page/quantization set) would
+        # quietly not take effect — fail loud on those; dropping unset (None)
+        # fields remains fine (they were never requested).
+        _dropped_set = [k for k in _dropped if kwargs.get(k) is not None]
+        if _dropped_set:
+            raise ValueError(
+                f"[SGLangDFlashTargetModel] this sglang's ServerArgs does not "
+                f"accept explicitly-set engine args: {_dropped_set} — refusing "
+                f"to silently drop them (values: "
+                f"{ {k: kwargs[k] for k in _dropped_set} })"
+            )
         if _dropped:
-            print(f"[SGLangDFlashTargetModel] dropping unsupported ServerArgs: {_dropped}")
+            print(f"[SGLangDFlashTargetModel] dropping unset ServerArgs: {_dropped}")
         kwargs = {k: v for k, v in kwargs.items() if k in _valid}
         # Optional escape hatch for ServerArgs fields SpecForge does not plumb
         # through its CLI (e.g. moe_runner_backend=deep_gemm for blockwise-FP8
@@ -272,8 +288,12 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 req.logprob_start_len = max(len(req.origin_input_ids) - 1, 0)
             req.init_next_round_input(tree_cache)
             # Admit the full request in one shot (what PrefillAdder does for
-            # unchunked prefill); get_fill_ids() truncates by fill_len.
-            req.fill_len = len(req.prefix_indices) + req.extend_input_len
+            # unchunked prefill). Newer sglang replaced fill_len/extend_input_len
+            # with Req.extend_range; get_fill_ids() truncates by extend_range.end
+            # (mirrors schedule_policy.py's unchunked admission).
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
 
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -330,10 +350,10 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             output = output.logits_output
 
         # Hidden states are returned only for COMPUTED tokens: with an empty
-        # tree (no session) extend_input_len == len(origin_input_ids) and this
-        # is identical to the old full-length split; with a session cache the
-        # matched prefix is served from KV and the output covers the suffix.
-        input_lens = [req.extend_input_len for req in reqs]
+        # tree (no session) extend_range.length == len(origin_input_ids) and
+        # this is identical to the old full-length split; with a session cache
+        # the matched prefix is served from KV and the output covers the suffix.
+        input_lens = [req.extend_range.length for req in reqs]
         prefix_lens = [len(req.prefix_indices) for req in reqs]
         # context = the captured (aux) mid-layer concat used by DFlash; final = the
         # post-norm last-layer hidden, surfaced for DSpark's L1 / confidence losses
@@ -367,7 +387,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             raise ValueError("SGLang output does not contain hidden states.")
 
         if session_tree is not None and os.environ.get("SPECFORGE_KV_DEBUG") == "1":
-            print(f"[KV] fill={reqs[0].fill_len} prefix={len(reqs[0].prefix_indices)} extend={reqs[0].extend_input_len} commit={cache_commit_len}", flush=True)
+            print(f"[KV] fill={reqs[0].extend_range.end} prefix={len(reqs[0].prefix_indices)} extend={reqs[0].extend_range.length} commit={cache_commit_len}", flush=True)
         if session_tree is not None:
             # Persist the KV of the COMMITTED prefix into the session tree so the
             # next call's prefix match serves it from cache. Only committed
@@ -376,7 +396,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             # never extend past the committed length — the computed suffix is
             # guaranteed to cover every position the verifier reads.
             for req in reqs:
-                fill_len = req.fill_len
+                fill_len = req.extend_range.end
                 commit = (
                     fill_len
                     if cache_commit_len is None
