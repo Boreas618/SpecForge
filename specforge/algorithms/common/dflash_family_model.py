@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -174,7 +177,31 @@ class OnlineDFlashModel(nn.Module):
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
         if max_n <= 0:
-            raise ValueError("should preprocess the data.")
+            # No sample in this micro-batch has a usable anchor position.
+            #
+            # Raising here is unsafe under distributed training. The loss
+            # denominator is all-reduced across the world further down
+            # (`dist.all_reduce(global_loss_den, ...)`), so a rank that raises
+            # exits *before* that collective and every other rank blocks on it
+            # until the NCCL timeout. One degenerate micro-batch on one rank
+            # therefore hangs the entire job rather than failing it.
+            #
+            # Degrade to a fully-masked micro-batch instead: `keep_mask` is all
+            # False, so this rank contributes 0 to both the local and the global
+            # loss denominator and 0 to every numerator, while still reaching
+            # the collective. Training continues on the other ranks' samples.
+            # If *no* rank has supervision, the post-all-reduce check on
+            # `global_loss_den` still raises -- collectively, on every rank.
+            logger.warning(
+                "No valid anchor positions in this micro-batch "
+                "(need a supervised position within seq_len - block_size); "
+                "contributing zero supervision for this step. Persistent "
+                "occurrences usually mean the target emitted non-finite hidden "
+                "states, or the data needs preprocessing."
+            )
+            anchors = torch.zeros((bsz, 1), dtype=torch.long, device=device)
+            keep_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            return anchors, keep_mask
 
         indices = (
             torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
@@ -786,9 +813,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
         valid_counts = valid.sum(dim=1)
         width = min(self.num_anchors, int(valid_counts.max().item()))
         if width <= 0:
-            raise ValueError(
-                "DSpark found no valid anchor with two consecutive loss tokens"
+            # No sample here has two consecutive supervised tokens. See the
+            # note in OnlineDFlashModel._sample_anchor_positions: raising would
+            # skip this rank past the all-reduce of the loss denominator and
+            # hang every peer, so degrade to a fully-masked micro-batch that
+            # contributes nothing but still reaches the collective.
+            logger.warning(
+                "DSpark found no valid anchor with two consecutive loss tokens; "
+                "contributing zero supervision for this step. Persistent "
+                "occurrences usually mean the target emitted non-finite hidden "
+                "states, which zeroes the loss mask."
             )
+            bsz = loss_mask.shape[0]
+            anchors = torch.zeros((bsz, 1), dtype=torch.long, device=device)
+            keep_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            return anchors, keep_mask
         indices = torch.arange(valid.shape[1], device=device).expand(
             loss_mask.shape[0], -1
         )
