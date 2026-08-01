@@ -320,9 +320,15 @@ cmd_probe() {
   # Single-node capture-plumbing parity probe (EXECUTION_DOC P9). Run BEFORE the
   # first smoke; requires this node's 4 GPUs free.
   env_common
+  # Aux capture layers come from the draft config (single source of truth) —
+  # the probe script default is the 947B layer set and does not fit the
+  # 42-layer Inkling-Small target.
+  local layer_ids
+  layer_ids=$(python3 -c "import json;print(\" \".join(map(str, json.load(open(\"$DRAFT_CONFIG\"))[\"dflash_config\"][\"target_layer_ids\"])))")
   torchrun --nnodes 1 --nproc-per-node "$NUM_GPUS" --master-port "$MASTER_PORT" \
     "$ROOT_DIR/scripts/probe_nda_inkling_capture.py" \
     --target-model-path "$TARGET_MODEL" --tp-size "$NUM_GPUS" \
+    --layer-ids $layer_ids \
     --chat-template "$CHAT_TEMPLATE" \
     --embedding-key model.llm.embed.weight --lm-head-key model.llm.unembed.weight \
     $(sglang_flags)
