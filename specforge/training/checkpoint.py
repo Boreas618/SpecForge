@@ -271,12 +271,6 @@ class CheckpointManager:
                 for rank, item in enumerate(descriptors)
                 if item["error"] is not None
             ]
-            if failures:
-                raise RuntimeError(
-                    f"resume checkpoint {original_path!r} is not readable on "
-                    "every rank: "
-                    + "; ".join(f"rank {rank}: {error}" for rank, error in failures)
-                )
             identities = {
                 (
                     item["checkpoint"],
@@ -285,12 +279,52 @@ class CheckpointManager:
                     item["strategy"],
                 )
                 for item in descriptors
+                if item["error"] is None
             }
-            if len(identities) != 1:
-                raise ValueError(
-                    f"resume checkpoint {original_path!r} resolves to different "
-                    f"training states across ranks: {descriptors}"
+            if failures or len(identities) != 1:
+                # On node-local checkpoint storage the newest checkpoint can
+                # exist on only some nodes (e.g. a crash mid-save): ranks then
+                # resolve "latest" differently, or some cannot resolve at all.
+                # When the caller named a run ROOT, renegotiate collectively:
+                # resume from the newest checkpoint complete on EVERY rank.
+                target = None
+                root = cls._resume_root(original_path)
+                if root is not None:
+                    per_rank_steps = [None] * world
+                    torch.distributed.all_gather_object(
+                        per_rank_steps, cls._local_complete_steps(root)
+                    )
+                    common = cls.newest_common_step(per_rank_steps)
+                    if common is not None:
+                        run_id, step = common
+                        target = os.path.join(root, f"{run_id}-step{step}")
+                if target is None:
+                    if failures:
+                        raise RuntimeError(
+                            f"resume checkpoint {original_path!r} is not readable on "
+                            "every rank: "
+                            + "; ".join(
+                                f"rank {rank}: {error}" for rank, error in failures
+                            )
+                        )
+                    raise ValueError(
+                        f"resume checkpoint {original_path!r} resolves to different "
+                        f"training states across ranks: {descriptors}"
+                    )
+                logger.warning(
+                    "resume target %r resolves inconsistently across ranks; "
+                    "falling back to the newest checkpoint present on every "
+                    "rank: %s",
+                    original_path,
+                    os.path.basename(target),
                 )
+                path = target
+                state = torch.load(
+                    os.path.join(path, STATE_FILE),
+                    map_location=map_location,
+                    weights_only=False,
+                )
+                local_error = None
         if local_error is not None:
             raise local_error
         assert state is not None
@@ -318,6 +352,66 @@ class CheckpointManager:
                 f"weights and counters only"
             )
         return state
+
+    @staticmethod
+    def newest_common_step(per_rank):
+        """Pick the newest ``(run_id, step)`` complete on EVERY rank.
+
+        ``per_rank`` holds, for each rank, a mapping of run id -> iterable of
+        locally complete steps. Returns ``None`` when no step is shared by all
+        ranks. Raises when more than one run id qualifies — a root must never
+        choose between unrelated runs silently.
+        """
+        if not per_rank:
+            return None
+        common_runs = set(per_rank[0])
+        for rank_map in per_rank[1:]:
+            common_runs &= set(rank_map)
+        candidates = []
+        for run_id in common_runs:
+            steps = set(per_rank[0][run_id])
+            for rank_map in per_rank[1:]:
+                steps &= set(rank_map[run_id])
+            if steps:
+                candidates.append((run_id, max(steps)))
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            raise ValueError(
+                "resume root contains multiple checkpoint runs with commonly "
+                f"available steps: {sorted(c[0] for c in candidates)}; select "
+                "one checkpoint explicitly"
+            )
+        return candidates[0]
+
+    @classmethod
+    def _local_complete_steps(cls, root):
+        """Run id -> locally complete steps under ``root`` (this rank's disk)."""
+        by_run = {}
+        pattern = re.compile(r"^(.+)-step(\d+)$")
+        for candidate in glob.glob(os.path.join(glob.escape(root), "*-step*")):
+            match = pattern.match(os.path.basename(candidate))
+            if match and os.path.isfile(os.path.join(candidate, STATE_FILE)):
+                by_run.setdefault(match.group(1), []).append(int(match.group(2)))
+        return by_run
+
+    @classmethod
+    def _resume_root(cls, path):
+        """The run root ``path`` denotes, or ``None`` for an explicit target.
+
+        Explicit targets (a checkpoint dir or its state file) must keep the
+        strict cross-rank identity check; only a root — where each rank
+        resolves ``latest`` against its own disk — may renegotiate.
+        """
+        path = str(path)
+        if path.startswith("file://"):
+            path = path[len("file://") :]
+        path = os.path.abspath(os.path.expanduser(path))
+        if os.path.basename(path) == STATE_FILE:
+            return None
+        if os.path.isfile(os.path.join(path, STATE_FILE)):
+            return None
+        return path if os.path.isdir(path) else None
 
     @classmethod
     def resolve_resume_dir(cls, path: str) -> str:

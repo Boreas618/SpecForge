@@ -476,5 +476,32 @@ class TestDistributedSaveAndResume(unittest.TestCase):
             self.assertEqual(res["best_step"], 3)
 
 
+class TestNewestCommonStep(unittest.TestCase):
+    """Pure selection logic behind the node-local resume fallback."""
+
+    def _f(self, per_rank):
+        from specforge.training.checkpoint import CheckpointManager
+
+        return CheckpointManager.newest_common_step(per_rank)
+
+    def test_picks_newest_step_present_on_every_rank(self):
+        self.assertEqual(
+            self._f([{"run": [100, 250]}, {"run": [250, 100]}]), ("run", 250)
+        )
+
+    def test_trailing_rank_bounds_the_choice(self):
+        # rank 1 missed the newest save (crash mid-save): fall back to 100
+        self.assertEqual(self._f([{"run": [100, 250]}, {"run": [100]}]), ("run", 100))
+
+    def test_no_common_step_returns_none(self):
+        self.assertIsNone(self._f([{"run": [250]}, {"run": [100]}]))
+        self.assertIsNone(self._f([{"a": [1]}, {"b": [1]}]))
+        self.assertIsNone(self._f([]))
+
+    def test_multiple_qualifying_runs_refuse_to_choose(self):
+        with self.assertRaises(ValueError):
+            self._f([{"a": [1], "b": [2]}, {"a": [1], "b": [2]}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
