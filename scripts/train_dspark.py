@@ -87,6 +87,7 @@ from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
 from specforge.tracker import create_tracker
 from specforge.utils import (
+    file_content_hash,
     get_last_checkpoint,
     get_local_device,
     print_on_rank0,
@@ -109,8 +110,8 @@ def parse_args():
         "the 'hf' backend always surfaces it.",
     )
     model_group.add_argument("--draft-config-path", type=str, default=None)
-    model_group.add_argument("--block-size", type=int, default=7)
-    model_group.add_argument("--num-draft-layers", type=int, default=5)
+    model_group.add_argument("--block-size", type=int, default=16)
+    model_group.add_argument("--num-draft-layers", type=int, default=1)
     model_group.add_argument(
         "--mask-token-id",
         type=int,
@@ -207,20 +208,8 @@ def parse_args():
         type=str,
         default=None,
         help="Directory of DeepSpec accept-length benchmark jsonl files. If set, "
-        "runs the DeepSpec-style mean-accepted-length eval (at "
-        "--eval-temperature) every --eval-interval steps, reusing the loaded "
-        "sglang target. Off if unset.",
-    )
-    dataset_group.add_argument(
-        "--eval-tasks",
-        type=str,
-        nargs="+",
-        default=["gsm8k", "mbpp", "mt-bench"],
-        help="Benchmarks for the in-loop accept-length eval (math + code + chat "
-        "trend probes), each capped at --eval-limit-per-task prompts. Must be a "
-        "subset of the DeepSpec 9-task suite with the jsonl present in "
-        "--eval-datasets-dir on EVERY node — a file present on some replicas "
-        "but not others deadlocks the eval's dp all-reduce.",
+        "runs the DeepSpec-style mean-accepted-length eval (greedy) every "
+        "--eval-interval steps, reusing the loaded sglang target. Off if unset.",
     )
     dataset_group.add_argument(
         "--eval-limit-per-task",
@@ -231,24 +220,11 @@ def parse_args():
     dataset_group.add_argument(
         "--eval-max-new-tokens",
         type=int,
-        default=2048,
+        default=1024,
         help="Max new tokens per prompt for the in-loop accept-length eval. "
-        "2048 = the standalone/final DeepSpec protocol (launcher EVAL_MAX_NEW), "
-        "so in-loop and final numbers are directly comparable and a thinking-ON "
-        "reasoning chain is not truncated; the KV-reuse verify keeps it "
-        "affordable. tau_probabilistic remains the cheap per-step proxy "
-        "between decoded evals.",
-    )
-    dataset_group.add_argument(
-        "--eval-temperature",
-        type=float,
-        default=1.0,
-        help="Sampling temperature for the in-loop accept-length eval. 1.0 = "
-        "DeepSpec's stochastic rejection-sampling default and the standalone/"
-        "final eval protocol (launcher EVAL_TEMP) — in-loop numbers then match "
-        "the final sweep in expectation (per-sample seeding keeps successive "
-        "in-loop evals comparable). 0 = greedy (deterministic, but easier than "
-        "the deployment workload and not comparable to the final eval).",
+        "1024 (not 256) so a thinking-ON generation's reasoning chain is not "
+        "fully truncated; the KV-reuse verify keeps it affordable. tau_"
+        "probabilistic remains the cheap per-step proxy between decoded evals.",
     )
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
@@ -260,10 +236,10 @@ def parse_args():
     )
 
     training_group = parser.add_argument_group("training")
-    training_group.add_argument("--num-epochs", type=int, default=10)
+    training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
-    training_group.add_argument("--max-length", type=int, default=4096)
+    training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
@@ -414,21 +390,26 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     """Build train and eval dataloaders."""
     import hashlib
 
-    # Bump when the chat template / loss-mask logic OR the training corpus changes
-    # so the processed-dataset cache invalidates. The base key uses only the
-    # train_data_path (not its content) + template NAME, so a content change under
-    # the same path (a template mask fix, or swapping the corpus) would otherwise
-    # silently reuse the stale tokenized/masked cache. v3 = thinking-ON render
-    # (GLMParser enable_thinking=True adds the "Reasoning Effort:" system header
-    # to every training sequence, matching the deployment prompt byte-for-byte).
-    # NOTE: keep in sync with the warm-cache key in examples/run_glm5.2_dspark_4node.sh.
-    mask_logic_version = "maskv3-glm-thinkon"
+    # Bump when the chat template / loss-mask logic changes so the processed-
+    # dataset cache invalidates. The base key uses only the template NAME, so a
+    # template *content* change (e.g. the GLM thinking-ON mask fix that recovered
+    # ~50% of samples) would otherwise silently reuse the stale tokenized/masked
+    # cache. v2 = GLM thinking-ON hybrid loss mask.
+    mask_logic_version = "maskv2-glm-thinkhybrid"
+    # Packaged-Jinja templates (NDA/Inkling) render from a file SpecForge ships;
+    # include its content hash so a template edit invalidates the tokenized cache
+    # (the base key only carries the template NAME).
+    from specforge.data.template import packaged_chat_template_hash
+
+    template_hash = packaged_chat_template_hash(args.chat_template) or "none"
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
+        f"{template_hash}-"
         f"{args.target_model_path}-"
-        f"{mask_logic_version}"
+        f"{mask_logic_version}-"
+        f"{file_content_hash(args.train_data_path)}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -611,12 +592,9 @@ def _maybe_run_accept_length_eval(
     args, dspark_model, draft_model, target_model, target_components, tokenizer,
     tracker, global_step,
 ):
-    """Best-effort in-loop DeepSpec accept-length eval, reusing the loaded sglang
-    target. Runs at --eval-temperature (default 1.0, the DeepSpec/final-eval
-    protocol) so in-loop numbers track the final sweep; run_deepspec_eval's
-    per-sample seeding keeps successive evals comparable despite the sampling.
-    Guarded: only runs when --eval-datasets-dir is set, and any failure is
-    swallowed so it can never kill a long training run. The standalone
+    """Best-effort in-loop DeepSpec accept-length eval (greedy), reusing the loaded
+    sglang target. Guarded: only runs when --eval-datasets-dir is set, and any
+    failure is swallowed so it can never kill a long training run. The standalone
     scripts/eval_dspark_deepspec.py is the primary/validated eval path."""
     if not args.eval_datasets_dir:
         return
@@ -636,11 +614,11 @@ def _maybe_run_accept_length_eval(
                 target_lm_head=target_components.lm_head,
                 target_embed_tokens=target_components.embed_tokens,
                 tokenizer=tokenizer,
-                tasks=list(args.eval_tasks),
+                tasks=None,
                 eval_datasets_dir=args.eval_datasets_dir,
                 limit_per_task=args.eval_limit_per_task,
                 max_new_tokens=args.eval_max_new_tokens,
-                temperature=args.eval_temperature,
+                temperature=0.0,
                 device=device,
                 verbose=(dist.get_rank() == 0),
             )
@@ -706,6 +684,59 @@ def main():
         draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
 
+    # Checkpoints are written by GLOBAL RANK 0 only and /scratch is node-local,
+    # so other nodes may find nothing and start at step 0 while rank 0's node
+    # resumes at step N. The ranks then enter DIFFERENT collectives — observed
+    # as four ranks in the step-256 grad-norm all-reduce while twelve sat in
+    # their step-6 forward all-gather — and the world deadlocks, reproducibly,
+    # on every post-checkpoint recovery. Resume only when every rank found the
+    # SAME checkpoint step; otherwise all ranks start fresh. To actually
+    # resume, distribute $OUTPUT_DIR/epoch_*_step_* to every node first.
+    if dist.is_initialized():
+        _step_t = torch.tensor([ckpt_info[1]], device=device, dtype=torch.long)
+        _min_t, _max_t = _step_t.clone(), _step_t.clone()
+        dist.all_reduce(_min_t, op=dist.ReduceOp.MIN)
+        dist.all_reduce(_max_t, op=dist.ReduceOp.MAX)
+        if int(_min_t.item()) != int(_max_t.item()):
+            # Fall back to the largest checkpoint EVERY rank has (typically
+            # the distributed init, or a synced save) — discarding everything
+            # here once restarted a converged continual run from RANDOM init
+            # (2026-07-15: rank0 at step 22500, others at the step-0 init;
+            # 'fresh' threw the init away too).
+            world_min = int(_min_t.item())
+            candidate = None
+            if world_min >= 0:
+                import glob as _glob
+                import re as _re
+
+                for d in _glob.glob(os.path.join(args.output_dir, "epoch_*_step_*")):
+                    m = _re.search(r"epoch_(\d+)_step_(\d+)$", d)
+                    if m and int(m.group(2)) == world_min:
+                        candidate = (d, (int(m.group(1)), world_min))
+                        break
+            _have = torch.tensor(
+                [1 if candidate else 0], device=device, dtype=torch.long
+            )
+            dist.all_reduce(_have, op=dist.ReduceOp.MIN)
+            if int(_have.item()) == 1:
+                draft_model_last_checkpoint, ckpt_info = candidate
+                print(
+                    f"[worldcheck] rank={dist.get_rank()} checkpoint step "
+                    f"{ckpt_info[1]} != world max {int(_max_t.item())} — "
+                    f"falling back to the common checkpoint at step "
+                    f"{world_min}: {draft_model_last_checkpoint}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[worldcheck] rank={dist.get_rank()} no common "
+                    f"checkpoint step across the world (min={world_min}, "
+                    f"max={int(_max_t.item())}) — starting FRESH world-wide",
+                    flush=True,
+                )
+                draft_model_last_checkpoint = None
+                ckpt_info = (0, 0)
+
     if draft_model_last_checkpoint:
         checkpoint_config_path = os.path.join(
             draft_model_last_checkpoint, "config.json"
@@ -769,8 +800,17 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
+    config_mask_token_id = (getattr(draft_model.config, "dflash_config", None) or {}).get(
+        "mask_token_id"
+    )
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
+    elif config_mask_token_id is not None:
+        # Draft configs may pin a padded-vocab mask slot (NDA/Inkling: a row in
+        # [200058, 201024) the tokenizer can never emit). Prefer it over mutating
+        # the tokenizer — add_special_tokens would mint an id the target's
+        # embed/head may not cover.
+        mask_token_id = int(config_mask_token_id)
     elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
     else:
@@ -918,6 +958,15 @@ def main():
         )
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
+    # Wedge forensics: every rank states the quantities that MUST agree
+    # world-wide for collective ordering to hold. Direct flushed print —
+    # print_with_rank logs at INFO with no handler and is silently dropped.
+    print(
+        f"[worldcheck] rank={dist.get_rank() if dist.is_initialized() else 0} "
+        f"acc_steps={args.accumulation_steps} len_dl={len(train_dataloader)} "
+        f"skip={skip_steps} start_epoch={start_epoch} resume_step={global_step}",
+        flush=True,
+    )
 
     print_on_rank0(f"Initializing tracker (report_to={args.report_to})...")
     tracker = create_tracker(args, args.output_dir)
@@ -965,6 +1014,12 @@ def main():
     last_global_grad_norm = None
     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
     stop = False
+    # Epoch label for the end-of-training checkpoint. num_epochs (== "fully
+    # trained") is only correct when every epoch ran; an early --max-steps
+    # stop overwrites this with the epoch it stopped IN, so resume continues
+    # that epoch instead of reading the run as complete. Captured at the stop
+    # site because the outer loop advances `epoch` before it sees `stop`.
+    final_epoch = args.num_epochs
 
     for epoch in range(start_epoch, args.num_epochs):
         if stop:
@@ -1037,6 +1092,12 @@ def main():
             (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
+                # Wedge forensics: boundaries are world collectives — if any
+                # rank prints a different boundary step, ordering is broken.
+                print(
+                    f"[hb] rank={dist.get_rank()} boundary step={global_step}",
+                    flush=True,
+                )
                 # DeepSpec parity (base_trainer.py): clip by the GLOBAL grad norm
                 # before the optimizer step. FSDP.clip_grad_norm_ all-reduces the
                 # norm across shards -> one uniform scale on every rank. The
@@ -1125,10 +1186,11 @@ def main():
             if args.max_steps is not None and global_step >= args.max_steps:
                 print_on_rank0(f"Reached max_steps={args.max_steps}; stopping.")
                 stop = True
+                final_epoch = epoch
                 break
 
     save_checkpoint(
-        args, args.num_epochs, global_step, dspark_model, draft_model, optimizer
+        args, final_epoch, global_step, dspark_model, draft_model, optimizer
     )
 
     tracker.close()
