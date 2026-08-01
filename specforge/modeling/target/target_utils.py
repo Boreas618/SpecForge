@@ -11,32 +11,87 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 
+class _RawConfigShim:
+    """Attribute view over a raw config.json, for checkpoints whose model_type
+    transformers does not recognize and that ship no remote config code (e.g.
+    NDA/Inkling's ``inkling_mm_model``). Nested dicts become shims recursively;
+    missing keys raise AttributeError so ``hasattr``/``getattr`` defaults work."""
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", data)
+
+    def __getattr__(self, name):
+        try:
+            value = self._data[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        return _RawConfigShim(value) if isinstance(value, dict) else value
+
+
+def load_target_config(
+    model_path: str,
+    cache_dir: Optional[str] = None,
+    trust_remote_code: bool = False,
+):
+    """AutoConfig with a raw-config.json fallback for unknown model types."""
+    try:
+        return AutoConfig.from_pretrained(
+            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+        )
+    except (ValueError, KeyError, OSError) as exc:
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.exists(config_path):
+            raise
+        with open(config_path, "r") as f:
+            raw = json.load(f)
+        print(
+            f"[TargetEmbeddingsAndHead] AutoConfig failed "
+            f"({type(exc).__name__}); using raw config.json shim for "
+            f"model_type={raw.get('model_type')!r}"
+        )
+        return _RawConfigShim(raw)
+
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
     Handles safetensors slicing and Weight Tying correctly.
     """
 
+    @staticmethod
+    def _checkpoint_vocab_size(cfg):
+        # The embed/unembed tensors in the checkpoint span the PADDED vocab.
+        # Registered config classes may rewrite vocab_size to the unpadded
+        # size for sampling (the nda_sgl fork's InklingConfig does: 200058
+        # vs padded 201024), so prefer padded_vocab_size when present. The
+        # raw-json shim path has no padded_vocab_size and vocab_size is
+        # already the padded value.
+        return getattr(cfg, "padded_vocab_size", None) or cfg.vocab_size
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         # Support for MLLMs with separate text_config
         if hasattr(config, "text_config"):
+            vocab = self._checkpoint_vocab_size(config.text_config)
             self.embed_tokens = nn.Embedding(
-                config.text_config.vocab_size,
+                vocab,
                 config.text_config.hidden_size,
-                padding_idx=config.text_config.pad_token_id,
+                padding_idx=getattr(config.text_config, "pad_token_id", None),
             )
             self.lm_head = nn.Linear(
                 config.text_config.hidden_size,
-                config.text_config.vocab_size,
+                vocab,
                 bias=False,
             )
         else:
+            vocab = self._checkpoint_vocab_size(config)
             self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+                vocab,
+                config.hidden_size,
+                padding_idx=getattr(config, "pad_token_id", None),
             )
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = nn.Linear(config.hidden_size, vocab, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -50,8 +105,9 @@ class TargetEmbeddingsAndHead(nn.Module):
         trust_remote_code: bool = False,
     ) -> "TargetEmbeddingsAndHead":
 
-        # 1. Load Config
-        config = AutoConfig.from_pretrained(
+        # 1. Load Config (AutoConfig, with a raw-json fallback for model types
+        # transformers does not know — e.g. NDA/Inkling `inkling_mm_model`).
+        config = load_target_config(
             model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
         instance = cls(config)
@@ -78,6 +134,30 @@ class TargetEmbeddingsAndHead(nn.Module):
 
         # 4. Load Weights
         instance._load_weights(local_model_path, embed_key, lm_head_key, tie_weights)
+
+        # 4b. muP logit-scale fold. Some targets (NDA/Inkling) compute
+        # logits = W_vocab · (H / mup) rather than W_vocab · H; every consumer
+        # of this frozen head (DSpark CE/L1/confidence objectives, the DeepSpec
+        # accept-length verifier at any temperature) needs the TRUE target
+        # distribution, so fold 1/mup into the weight copy exactly once here.
+        # Greedy argmax is unaffected; softmax temperature is corrected.
+        mup = getattr(config, "logits_mup_width_multiplier", None)
+        if mup is None and hasattr(config, "text_config"):
+            mup = getattr(config.text_config, "logits_mup_width_multiplier", None)
+        if mup:
+            if tie_weights:
+                raise RuntimeError(
+                    "logits_mup_width_multiplier with tied embeddings would "
+                    "corrupt the embedding table when folding the head scale; "
+                    "refusing. Untie or handle the scale explicitly."
+                )
+            instance.lm_head.weight.data.div_(float(mup))
+            instance.lm_head_mup_folded = float(mup)
+            print(
+                f"[TargetEmbeddingsAndHead] folded 1/{mup} muP logit scale into "
+                f"the frozen lm_head copy (logits now match the target's true "
+                f"distribution at any temperature)"
+            )
 
         # 5. Move to Device & Freeze
         instance.to(device=device, dtype=dtype)
