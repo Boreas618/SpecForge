@@ -24,6 +24,7 @@ import argparse
 from typing import Dict, Optional
 
 from specforge.export.checkpoint_io import materialize_draft, resolve_training_state
+from specforge.export.to_hf import ensure_dual_rope_schema
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
@@ -80,6 +81,7 @@ def export_to_sglang(
     # embeddings exactly as the trainer-side checkpoint filter does.
     full = {k: v for k, v in model.state_dict().items() if "embed" not in k.lower()}
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
+    ensure_dual_rope_schema(output_dir)
     return output_dir
 
 

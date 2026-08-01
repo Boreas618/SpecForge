@@ -110,8 +110,43 @@ def export_to_hf(
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
     model.save_pretrained(output_dir, state_dict=full_state)
+    ensure_dual_rope_schema(output_dir)
     return output_dir
 
+
+
+def ensure_dual_rope_schema(output_dir: str) -> None:
+    """Mirror the surviving rope schema into the other one in config.json.
+
+    transformers 5.x ``save_pretrained`` writes only the new
+    ``rope_parameters`` schema and drops legacy ``rope_scaling``. Serving
+    stacks and older transformers that read only the legacy key then
+    silently lose YaRN on long-context drafts — the draft falls back to
+    unscaled RoPE at serve time and accept length collapses beyond the
+    original context. Default (non-scaled) RoPE configs are left untouched.
+    """
+    cfg_path = os.path.join(output_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    def _kind(d):
+        return (d or {}).get("rope_type") or (d or {}).get("type")
+
+    rope_p = cfg.get("rope_parameters")
+    rope_s = cfg.get("rope_scaling")
+    if rope_p and not rope_s and _kind(rope_p) not in (None, "default"):
+        cfg["rope_scaling"] = {k: v for k, v in rope_p.items() if k != "rope_theta"}
+    elif rope_s and not rope_p and _kind(rope_s) not in (None, "default"):
+        mirrored = dict(rope_s)
+        if "rope_theta" in cfg:
+            mirrored.setdefault("rope_theta", cfg["rope_theta"])
+        cfg["rope_parameters"] = mirrored
+    else:
+        return
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=export_to_hf.__doc__)
