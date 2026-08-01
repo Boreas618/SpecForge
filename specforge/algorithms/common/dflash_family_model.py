@@ -137,6 +137,7 @@ class OnlineDFlashModel(nn.Module):
         objective_chunk_blocks: int = 128,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        sanitize_nonfinite: bool = True,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -159,10 +160,80 @@ class OnlineDFlashModel(nn.Module):
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.sanitize_nonfinite = bool(sanitize_nonfinite)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    @staticmethod
+    def _finite_report(name: str, t: torch.Tensor) -> str:
+        """One-line finiteness summary of a tensor, for non-finite debugging."""
+        td = t.detach()
+        finite = torch.isfinite(td)
+        n_bad = int((~finite).sum())
+        if n_bad == 0:
+            return f"{name}=finite"
+        has_inf = bool(torch.isinf(td).any())
+        has_nan = bool(torch.isnan(td).any())
+        absmax = float(td[finite].abs().max()) if bool(finite.any()) else float("nan")
+        return (
+            f"{name}={n_bad}/{td.numel()} nonfinite "
+            f"(inf={has_inf} nan={has_nan} finite_absmax={absmax:.3e})"
+        )
+
+    def _sanitize_nonfinite_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        target_last_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Drop non-finite target features from supervision.
+
+        Target capture can emit non-finite hidden states for individual rows
+        (serving-side numerical issues, allocator faults, kernel bugs). Left
+        alone, a single such row is fatal twice over: the loss goes non-finite,
+        and under data parallelism the gradient all-reduce propagates that one
+        rank's NaN to every rank, so one bad capture poisons the whole run.
+
+        Per-token treatment: zero the loss mask (excluded from supervision) AND
+        zero the feature itself, so inf/NaN cannot leak into healthy tokens
+        through the draft's attention over the context. A warning with a
+        per-tensor finiteness report keeps the condition visible; sampling-side
+        code is expected to tolerate a fully-masked micro-batch.
+        """
+        if not self.sanitize_nonfinite:
+            return hidden_states, loss_mask, target_last_hidden_states
+
+        ctx_finite = torch.isfinite(hidden_states).all(dim=-1)  # [B, S]
+        tgt_finite = (
+            torch.isfinite(target_last_hidden_states).all(dim=-1)
+            if target_last_hidden_states is not None
+            else ctx_finite
+        )
+        bad_tok = ~(ctx_finite & tgt_finite)
+        if bool(bad_tok.any()):
+            reports = [self._finite_report("hidden_states", hidden_states)]
+            if target_last_hidden_states is not None:
+                reports.append(
+                    self._finite_report(
+                        "target_last_hidden_states", target_last_hidden_states
+                    )
+                )
+            logger.warning(
+                "excluding %d/%d non-finite target tokens from supervision: %s",
+                int(bad_tok.sum()),
+                bad_tok.numel(),
+                "; ".join(reports),
+            )
+            loss_mask = loss_mask * (~bad_tok).to(loss_mask.dtype)
+            zeros = dict(nan=0.0, posinf=0.0, neginf=0.0)
+            hidden_states = torch.nan_to_num(hidden_states, **zeros)
+            if target_last_hidden_states is not None:
+                target_last_hidden_states = torch.nan_to_num(
+                    target_last_hidden_states, **zeros
+                )
+        return hidden_states, loss_mask, target_last_hidden_states
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -406,6 +477,10 @@ class OnlineDFlashModel(nn.Module):
             )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+
+        hidden_states, loss_mask, _ = self._sanitize_nonfinite_inputs(
+            hidden_states, loss_mask
+        )
 
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
@@ -1173,6 +1248,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
+        (
+            hidden_states,
+            loss_mask,
+            target_last_hidden_states,
+        ) = self._sanitize_nonfinite_inputs(
+            hidden_states, loss_mask, target_last_hidden_states
+        )
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
