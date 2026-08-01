@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -185,6 +186,19 @@ def print_args_with_dots(args):
             dot_count = total_width - len(key_str) - len(value_str)
             dot_fill = "·" * dot_count
             print(f"{key_str} {dot_fill} {value_str}")
+
+
+
+def file_content_hash(path, chunk_bytes=1 << 22):
+    """Short streamed sha256 of a file's bytes. Include this in dataset cache
+    keys so rebuilding the data at the SAME path invalidates tokenized caches
+    — a key that carries only the data file's path serves a stale cache
+    silently after the file changes."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(chunk_bytes), b""):
+            digest.update(block)
+    return digest.hexdigest()[:12]
 
 
 def print_on_rank0(message):
