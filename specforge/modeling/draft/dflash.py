@@ -79,9 +79,20 @@ class Qwen3DFlashAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        num_attention_heads = int(config.num_attention_heads)
+        num_key_value_heads = int(config.num_key_value_heads)
+        if (
+            num_attention_heads <= 0
+            or num_key_value_heads <= 0
+            or num_attention_heads % num_key_value_heads != 0
+        ):
+            raise ValueError(
+                "Qwen3DFlashAttention requires positive attention head counts and "
+                "num_attention_heads divisible by num_key_value_heads, got "
+                f"num_attention_heads={num_attention_heads}, "
+                f"num_key_value_heads={num_key_value_heads}."
+            )
+        self.num_key_value_groups = num_attention_heads // num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False

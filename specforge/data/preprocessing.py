@@ -357,6 +357,13 @@ def build_eagle3_dataset(
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
+    # Targets without a tokenizer-side chat template (NDA/Inkling) render via a
+    # Jinja packaged with SpecForge; install it before any apply_chat_template.
+    from .template import install_packaged_chat_template
+
+    if install_packaged_chat_template(tokenizer, chat_template):
+        print(f"Installed packaged chat template for '{chat_template}' on the tokenizer")
+
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
