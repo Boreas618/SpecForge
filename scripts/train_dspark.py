@@ -1058,6 +1058,18 @@ def main():
                     "--l1-loss-alpha 0 --no-confidence-head."
                 )
 
+            # Drain ALL engine streams before the FSDP forward enqueues its
+            # world all-gather. The engine prefill epilogue runs async on its
+            # own streams; FSDP gates the all-gather kernel on stream events,
+            # and an engine kernel still spinning leaves the gather parked in
+            # `scheduled` on the whole 16-rank world (flight-recorder
+            # signature of the 03:14Z wedge: pg-65 TP all-reduces completed,
+            # pg-0 _all_gather_base never launched, GPUs pinned at 100%).
+            # A per-micro-step device sync costs ~ms at 0.5 s/iter; if the
+            # engine tail itself hangs, training now stops HERE — naming the
+            # engine rather than a collective in every stack dump.
+            torch.cuda.synchronize()
+
             if tp_scatter:
                 # Keep this rank's slice of the node batch and trim its right
                 # padding (collator pads right; positions >= true length carry
@@ -1089,6 +1101,14 @@ def main():
                 last_hidden_states=last_hidden_states,
             )
 
+            # Mirror of the pre-forward drain: engine maintenance kernels
+            # (e.g. the per-step HybridReqToTokenPool reset) are issued async
+            # on engine streams AFTER the forward drain; BACKWARD_PRE param
+            # all-gathers gate on stream events and park in `scheduled` if an
+            # engine kernel is still spinning (v2 wedge signature 2026-07-30:
+            # default_pg all_reduce completed, _all_gather_base scheduled,
+            # ranks 2/3, three occurrences in 90 min). ~ms per micro-step.
+            torch.cuda.synchronize()
             (loss / args.accumulation_steps).backward()
 
             if global_step % args.accumulation_steps == 0:
