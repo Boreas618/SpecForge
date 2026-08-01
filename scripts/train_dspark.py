@@ -1177,7 +1177,11 @@ def main():
                     args, epoch, global_step, dspark_model, draft_model, optimizer
                 )
 
-            if args.eval_datasets_dir and global_step % args.eval_interval == 0:
+            if (
+                args.eval_datasets_dir
+                and args.evals_per_epoch
+                and global_step % args.eval_interval == 0
+            ):
                 _maybe_run_accept_length_eval(
                     args, dspark_model, draft_model, target_model,
                     target_components, tokenizer, tracker, global_step,
