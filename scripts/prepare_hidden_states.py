@@ -75,6 +75,7 @@ from specforge.distributed import (
 )
 from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
 from specforge.utils import (
+    file_content_hash,
     load_tokenizer,
     print_args_with_dots,
     print_with_rank,
@@ -834,7 +835,12 @@ def main():
     tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+    cache_params_string = (
+        f"{args.data_path}-{args.max_length}-{args.chat_template}-"
+        f"{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-"
+        # rebuilt data at the same path must not reuse the old tokenized cache
+        f"{file_content_hash(args.data_path)}"
+    )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
