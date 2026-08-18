@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -9,6 +10,9 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -53,6 +57,9 @@ def create_dflash_sdpa_mask(
     sliding_window: Optional[int] = None,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -94,9 +101,13 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    flex_block_size=None,
     sliding_window: Optional[int] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
@@ -128,8 +139,17 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    kwargs = {}
+    if flex_block_size is not None:
+        kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+        **kwargs,
     )
 
 
@@ -177,7 +197,11 @@ class OnlineDFlashModel(nn.Module):
         self._cached_bsz: Optional[int] = None
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample anchors whose clean token and first target are supervised."""
 
@@ -186,11 +210,25 @@ class OnlineDFlashModel(nn.Module):
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
         valid_counts = valid.sum(dim=1)
-        width = min(self.num_anchors, int(valid_counts.max().item()))
+        if max_valid_anchors is None:
+            # Direct model callers may supply an already-device-resident mask.
+            # Training strategies pass the CPU-computed value and avoid this
+            # synchronizing fallback on CUDA.
+            max_valid_anchors = int(valid_counts.max().item())
+        width = min(self.num_anchors, max(0, int(max_valid_anchors)))
         if width == 0:
-            raise ValueError(
-                "DFlash-family training requires two consecutive supervised tokens"
+            # Raising here would skip this rank past later loss collectives and
+            # hang peers that did find valid anchors. Keep one fully masked
+            # block so this rank contributes zero supervision and participates.
+            logger.warning(
+                "%s: no valid anchor positions in this micro-batch; "
+                "contributing zero supervision for this step.",
+                type(self).__name__,
             )
+            bsz = loss_mask.shape[0]
+            anchors = torch.zeros((bsz, 1), dtype=torch.long, device=device)
+            keep_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            return anchors, keep_mask
 
         random_values = torch.rand(valid.shape, device=device)
         random_values.masked_fill_(~valid, 2.0)
@@ -279,12 +317,16 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len,
+            loss_mask,
+            device,
+            max_valid_anchors=max_valid_anchors,
         )
 
         noise_embedding = self._create_noise_embed(
@@ -309,6 +351,12 @@ class OnlineDFlashModel(nn.Module):
             "block_size": self.block_size,
             "device": device,
         }
+        if (
+            self.attention_backend == "flex_attention"
+            and flex_attention_backend() == "FLASH"
+        ):
+            # FLASH requires a minimum of this block size.
+            mask_args["flex_block_size"] = (256, 128)
         full_attn_mask = mask_builder(**mask_args)
         sliding_window = self.draft_model.sliding_window
         dflash_attn_mask = full_attn_mask
@@ -321,11 +369,20 @@ class OnlineDFlashModel(nn.Module):
                 ),
             }
 
+        draft_kwargs = {}
+        if self.attention_backend == "flex_attention":
+            # DFlash's dynamic short-query batches are training/prefill shaped,
+            # not autoregressive decoding.  AUTO may route q_len < 128 to the
+            # more restrictive flex-decoding kernel, whose config set can be
+            # empty for DFlash's sparse BlockMask.  Keep the general Triton
+            # Flex Attention kernel for every DFlash-family batch.
+            draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -387,6 +444,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -401,6 +459,7 @@ class OnlineDFlashModel(nn.Module):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -610,6 +669,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
+        max_valid_anchors: Optional[int] = None,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -623,6 +683,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         label_start = 1 if self.shift_label else 0
@@ -704,7 +765,10 @@ class OnlineDominoModel(OnlineDFlashModel):
             "base_accuracy": (base_correct_num / (accuracy_denom + 1e-6)).detach(),
             "accept_len": (accept_num / (accept_den + 1e-6)).detach(),
             "base_accept_len": (base_accept_num / (accept_den + 1e-6)).detach(),
-            "lambda_base": torch.tensor(lambda_base, device=loss.device),
+            # Telemetry does not participate in the objective. Keeping this as
+            # a host scalar avoids a tiny H2D copy that otherwise synchronizes
+            # the whole forward stream once per micro-step.
+            "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
 
@@ -1068,6 +1132,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1078,6 +1143,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         (
